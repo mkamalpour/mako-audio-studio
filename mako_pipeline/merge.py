@@ -99,6 +99,7 @@ class MergeResult:
     rows: List[dict] = field(default_factory=list)
     plan_rows: List[List[str]] = field(default_factory=list)
     qc_rows: List[dict] = field(default_factory=list)
+    preview_audio: Optional[Tuple[int, np.ndarray]] = None
 
 
 # ----------------------------------------------------------------------------
@@ -608,10 +609,13 @@ def _encode(arr_or_raw, n, sr, out: Path, fmt: str, cfg: MergeConfig, raw: bool)
 
 
 def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: bool = False,
-              script_text: Optional[str] = None, override_text: Optional[str] = None) -> MergeResult:
+              script_text: Optional[str] = None, override_text: Optional[str] = None,
+              preview_section: Optional[int] = None) -> MergeResult:
     """Merge clean/ into merged/<timestamp>/. With dry_run nothing is written (merge plan preview)."""
     rep = Report(stage="merge")
     res = MergeResult(rep)
+    if preview_section is not None:
+        dry_run = True  # section audition can never create an export or change controls
     try:
         find_ffmpeg()
     except FFmpegMissing as e:
@@ -646,6 +650,9 @@ def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: boo
     rep.issues += ov_issues
     validate_scan(scan, ignored, rep)
     order = build_order(scan, cfg, script, rep)
+    if preview_section is not None and preview_section not in order:
+        rep.fail('E_BAD_SETTINGS', f'Section {preview_section} has no prepared clips.')
+        return res
     total = max(1, sum(len(v) for v in order.values()))
     clips_by_sec: Dict[int, List[Clip]] = {}
     done = 0
@@ -716,6 +723,19 @@ def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: boo
                   "lines_skipped": skipped_n, "full_seconds": round(full_len / sr, 3),
                   "gains_db": {k: round(v, 2) for k, v in gains.items()}, "transitions": kinds}
     res.qc_rows = _qc_rows(all_clips)
+    if preview_section is not None:
+        if preview_section not in plans:
+            rep.fail('E_NO_READABLE_AUDIO', f'Section {preview_section} has no readable clips in its order.')
+            return res
+        if progress:
+            progress(0.9, f'Rendering section {preview_section} preview')
+        audio, _ = render_section(plans[preview_section], sr, False)
+        if len(audio) and float(np.max(np.abs(audio))) > 1.0:
+            rep.add('W_OUTPUT_CLIPPED', 'Overlapping clips exceed full scale in the section preview. Reduce gain or overlap.')
+        res.preview_audio = (sr, (np.clip(audio, -1, 1) * 32767).round().astype(np.int16))
+        rep.log(f'Section {preview_section} preview ready; no files were exported or saved.')
+        if progress:
+            progress(1.0, 'Section preview ready')
     if dry_run:
         rep.log("Plan only: nothing was written.")
         return res

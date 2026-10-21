@@ -169,6 +169,25 @@ class Settings:
     merge: MergeConfig = field(default_factory=MergeConfig)
 
 
+# Presets alter only the visible processing choices; recordings and explicit clip overrides stay intact.
+SOUND_PRESETS = {
+    'Clean dialogue': dict(pacing='fixed', gap_diff_ms=250, gap_same_ms=150,
+                          section_gap_ms=800, variation_pct=0, trim=True,
+                          room_tone=True, comfort_noise=False, match_loudness=True,
+                          target_lufs=-16, match_tone=False, overlap_amount=0),
+    'Natural conversation': dict(pacing='natural', pacing_profile='auto', gap_diff_ms=300,
+                                 gap_same_ms=200, section_gap_ms=1000, variation_pct=20,
+                                 trim=True, room_tone=True, comfort_noise=True,
+                                 match_loudness=True, target_lufs=-16, match_tone=False,
+                                 overlap_amount=0.3, quick_reply_amount=1,
+                                 thinking_pause_amount=1, rhythm_memory=1, tempo_drift=1),
+    'Just join clips': dict(pacing='fixed', gap_diff_ms=0, gap_same_ms=0,
+                            section_gap_ms=0, variation_pct=0, trim=False,
+                            room_tone=False, comfort_noise=False, match_loudness=False,
+                            match_tone=False, overlap_amount=0),
+}
+
+
 # ----------------------------------------------------------------------------
 # Flat dict <-> Settings  (mako_settings.json is a flat JSON object)
 # ----------------------------------------------------------------------------

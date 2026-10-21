@@ -103,6 +103,14 @@ def parse_script(text: str, source: str = "script.txt") -> ScriptResult:
             continue
         head, body = line.split(":", 1)
         head = head.strip()
+        if body.strip() == '-':
+            sec = parse_sec_code(head)
+            if sec is None or not 1 <= sec <= 999 or sec in res.sections or sec in res.exact:
+                res.issues.append(Issue('E_SCRIPT_SYNTAX', 'error',
+                                        f'{where}: use a unique section followed by - to exclude it.', file=source))
+            else:
+                res.exact[sec] = []
+            continue
         # Explicit clip IDs are decimal line numbers, e.g. K3 R1 K1.
         explicit = bool(re.search(r'[KR]\d', body, re.I))
         if explicit:

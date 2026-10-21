@@ -13,7 +13,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 import gradio as gr
 
 from . import constants as C
-from .config import (Settings, launcher_dir, resolve_settings, save_settings, settings_from_dict,
+from .config import (SOUND_PRESETS, Settings, launcher_dir, resolve_settings, save_settings, settings_from_dict,
                      validate_intake)
 from .ffmpeg import check_environment
 from .intake import (load_rename_overrides, overrides_from_table, plan_intake, run_intake,
@@ -23,6 +23,7 @@ from .overrides import HEADER as OV_HEADER, read_rows, overrides_text, parse_ove
 from .report import Report
 from .script import parse_script
 from .util import write_text_atomic
+from .timeline_ui import CSS as TIMELINE_CSS, JS as TIMELINE_JS, render_board
 
 STYLE_LABELS = list(C.STYLE_LABELS)
 TABLE_HEAD = ["speaker", "source_file", "section", "line", "skip", "new name", "note"]
@@ -277,7 +278,7 @@ def section_rows(text, section):
     for line in (text or "").splitlines():
         key, sep, tokens = line.partition(":")
         if sep and key.strip() == str(section):
-            return [[token] for token in tokens.split("#", 1)[0].split()]
+            return [[token] for token in tokens.split("#", 1)[0].split() if token != "-"]
     return []
 
 
@@ -305,7 +306,7 @@ def apply_section(text, section, rows):
     rows = rows.values.tolist() if hasattr(rows, "values") else (rows or [])
     tokens = [_s(row[0]) for row in rows if row and _s(row[0])]
     import re
-    if not tokens or any(not re.fullmatch(r"[kKrR](?:[1-9][0-9]*)?", token) for token in tokens):
+    if any(not re.fullmatch(r"[kKrR](?:[1-9][0-9]*)?", token) for token in tokens):
         raise gr.Error("Use clip IDs such as K1, R1, K2, R10; one clip per row.")
     bare = [len(token) == 1 for token in tokens]
     if any(bare) and not all(bare):
@@ -316,7 +317,7 @@ def apply_section(text, section, rows):
             raise gr.Error("Each clip can appear only once in a section.")
         if any(len(token[1:]) > 4 for token in tokens):
             raise gr.Error("Dialogue IDs must be between 1 and 9999.")
-    replacement = f"{section}: " + " ".join(tokens)
+    replacement = f"{section}: " + (" ".join(tokens) if tokens else "-")
     lines = (text or "").splitlines()
     for index, line in enumerate(lines):
         if line.partition(":")[0].strip() == str(section):
@@ -327,14 +328,121 @@ def apply_section(text, section, rows):
     return "\n".join(lines)
 
 
+def _board_context(project, text):
+    import hashlib
+    context = hashlib.sha256(str(Path(project or '.').resolve()).encode('utf-8')).hexdigest()[:20]
+    revision = hashlib.sha256((text or '').encode('utf-8')).hexdigest()[:20]
+    return context, revision
+
+
+def timeline_view(project, text, section, selected):
+    from .timeline import clip_catalog
+    rows = section_rows(text, section)
+    tokens = [_s(row[0]).upper() for row in rows]
+    if any(len(token) == 1 for token in tokens):
+        return '<div id="clip-board"><p>This section uses legacy speaker turns. Fill the order from prepared recordings to arrange exact clips visually. The table remains available below.</p></div>'
+    return render_board(clip_catalog(project, section) if section else [], tokens, section, selected, *_board_context(project, text))
+
+
+def timeline_edit(payload, project, text, section, selected, history):
+    import json
+    from .timeline import clip_catalog
+    try:
+        data = json.loads(payload or '{}')
+    except (TypeError, ValueError):
+        raise gr.Error('Invalid editor action. Refresh the section and try again.')
+    if not isinstance(data, dict):
+        raise gr.Error('Invalid editor action.')
+    context, revision = _board_context(project, text)
+    if data.get('context') != context or data.get('revision') != revision:
+        raise gr.Error('The episode order changed. Please try the action again on the updated board.')
+    if str(data.get('section')) != str(section):
+        raise gr.Error('Section changed. Please select your clip again.')
+    tokens = [_s(row[0]).upper() for row in section_rows(text, section)]
+    old = tokens[:]
+    token = _s(data.get('token')).upper()
+    action = data.get('action')
+    history = dict(history or {})
+    key = str(section)
+    track = dict(history.get(key, {'undo': [], 'redo': []}))
+    if action in ('select', 'up', 'down', 'remove') and token not in tokens:
+        raise gr.Error('That clip is no longer in the current section.')
+    if action == 'select':
+        if token not in tokens:
+            raise gr.Error('Choose a clip in this section.')
+        return gr.update(), token, history, 'Clip selected. Use Listen below to hear its prepared recording.'
+    if action == 'reorder':
+        proposed = data.get('tokens', [])
+        if not isinstance(proposed, list) or any(not isinstance(value, str) for value in proposed) or sorted(proposed) != sorted(tokens):
+            raise gr.Error('Order changed. Try moving the clip again.')
+        tokens = proposed
+    elif action in ('up', 'down'):
+        if token in tokens:
+            index = tokens.index(token)
+            target = index + (-1 if action == 'up' else 1)
+            if 0 <= target < len(tokens):
+                tokens[index], tokens[target] = tokens[target], tokens[index]
+    elif action == 'remove':
+        tokens = [value for value in tokens if value != token]
+    elif action == 'add':
+        available = {item['token'] for item in clip_catalog(project, section)}
+        if token not in available:
+            raise gr.Error('That prepared clip is no longer available.')
+        if token not in tokens:
+            tokens.append(token)
+    elif action in ('undo', 'redo'):
+        source = list(track.get(action, []))
+        if not source:
+            return gr.update(), gr.update(), history, 'Nothing to ' + action + '.'
+        tokens = source.pop()
+        other = 'redo' if action == 'undo' else 'undo'
+        track[action] = source
+        track[other] = list(track.get(other, [])) + [old]
+    else:
+        raise gr.Error('Unknown section editor action.')
+    if tokens != old and action not in ('undo', 'redo'):
+        track['undo'] = (list(track.get('undo', [])) + [old])[-40:]
+        track['redo'] = []
+    history[key] = track
+    result = apply_section(text, section, [[value] for value in tokens])
+    return result, token if token in tokens else (tokens[0] if tokens else None), history, 'Section updated in your current episode order. Save when ready.'
+
+
+def do_section_preview(*vals, progress=gr.Progress()):
+    from .names import parse_sec_code
+    st = settings_from_values(vals[:len(KEYS)])
+    script, overrides = form_controls(vals[len(KEYS)], vals[len(KEYS) + 1])
+    section = vals[len(KEYS) + 2]
+    parsed_section = parse_sec_code(str(section or ''))
+    if parsed_section is None or not 1 <= parsed_section <= 999:
+        raise ValueError('Choose a valid section to preview.')
+    res = run_merge(st.intake.project, st.merge, lambda f, d: progress(f, desc=d),
+                    dry_run=True, script_text=script, override_text=overrides, preview_section=parsed_section)
+    return res.preview_audio, _warn_block(res.report) + '\n' + res.report.to_text(with_decisions=False)
+
+
 def create_interface() -> "gr.Blocks":
     st = resolve_settings()
     env = check_environment()
-    with gr.Blocks(title="Mako Audio Studio", theme=gr.themes.Soft(primary_hue="teal", font=["Segoe UI", "Arial", "sans-serif"], font_mono=["Consolas", "monospace"]), css="""
+    with gr.Blocks(title="Mako Audio Studio", theme=gr.themes.Soft(primary_hue="teal", font=["Segoe UI", "Arial", "sans-serif"], font_mono=["Consolas", "monospace"]), js=TIMELINE_JS, css=TIMELINE_CSS + """
         .gradio-container {max-width: 1220px !important; font-family: 'Segoe UI', sans-serif;}
         #studio-header {border-left: 4px solid #0f766e; padding: 8px 20px; margin: 12px 0 22px;}
         #studio-header h1 {letter-spacing: -.04em; font-size: 36px; margin-bottom: 6px;}
-        .tab-nav button {font-weight: 650 !important; padding: 14px 18px !important;}
+        #studio-tabs > .tab-nav, #studio-tabs > .tab-wrapper {display:none !important;}
+        #workflow-nav {background:transparent;border:0;padding:0;}
+        #workflow-nav > .wrap {display:grid !important;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;}
+        #workflow-nav label {min-width:0 !important;min-height:48px;padding:12px !important;border-radius:7px !important;font-weight:650;white-space:normal;line-height:1.35;}
+        #workflow-nav label.selected {background:#dcefe7 !important;border-color:#147d70 !important;color:#174c3e !important;}
+        @media(max-width:700px){#workflow-nav > .wrap {grid-template-columns:repeat(2,minmax(0,1fr));}#workflow-nav label{font-size:12px;}}
+        .tab-nav {gap:4px !important; flex-wrap:wrap !important; border-bottom:1px solid #ccdbd5 !important;}
+        .tab-nav button {font-weight:650 !important; padding:13px 16px !important; white-space:normal !important; min-height:48px;}
+        .tab-nav button.selected {border-bottom:3px solid #147d70 !important;}
+        button.primary {box-shadow:none !important;}
+        #studio-header p:first-child {font-size:11px;letter-spacing:.14em;color:#477267;font-weight:700;}
+        #studio-header p:last-child {font-size:15px;color:#4e655a;}
+        #project-controls {padding-bottom:12px;border-bottom:1px solid #d2dfd8;margin-bottom:10px;}
+        .gradio-container {--radius-lg:10px;}
+        input:focus-visible,textarea:focus-visible,button:focus-visible {outline-offset:3px;}
         .speaker-panel {border-top: 3px solid #0f766e; padding-top: 12px;}
         .speaker-panel.reza {border-top-color: #b7791f;}
         .studio-table {min-width: 0 !important; max-width: 100%; overflow-x: auto !important;}
@@ -346,6 +454,7 @@ def create_interface() -> "gr.Blocks":
           #studio-header h1 {font-size: 27px;}
           #project-controls {gap: 6px;}
           .gradio-container {padding-top: 8px !important;}
+          .tab-nav button {font-size:12px !important;padding:9px 7px !important;flex:1 1 43% !important;}
         }
         """) as demo:
         gr.Markdown("MAKO ENTERTAINMENT / AUDIO WORKSPACE\n# Mako Audio Studio\nRecord separately. Build one conversation.", elem_id="studio-header")
@@ -356,137 +465,172 @@ def create_interface() -> "gr.Blocks":
             b_proj = gr.Button("Browse", scale=1)
             b_load = gr.Button("Load project settings", scale=1)
         comps: Dict[str, Any] = {"project": project}
-        with gr.Tab("1 - Recordings & names"):
-            gr.Markdown("Choose each recording folder. Default names: **K11 / R11** = speaker, section 1, dialogue 1. Case does not matter. **a = 10, b = 11**, then c, d, and so on. **Kbb = section 11, dialogue 11.** Originals stay untouched.")
-            with gr.Row():
-                for sp in C.SPEAKERS:
-                    sc = st.intake.speakers[sp]
-                    with gr.Column(elem_classes=["speaker-panel", sp]):
-                        gr.Markdown(f"### {sp.capitalize()}  /  {sp[0].upper()}")
-                        comps[f"{sp}_folder"] = gr.Textbox(label="Raw folder", value=sc.folder)
-                        bb = gr.Button(f"Browse {sp}'s folder")
-                        bb.click(browse_folder, None, comps[f"{sp}_folder"])
-                        comps[f"{sp}_style"] = gr.Dropdown(STYLE_LABELS, value=C.STYLE_TO_LABEL[sc.style], label="Naming style")
-                        comps[f"{sp}_pattern"] = gr.Textbox(label="Custom pattern (without extension)", value=sc.pattern, placeholder="s{section}{line} or {section}{line}", visible=sc.style == "custom")
-                        comps[f"{sp}_sections"] = gr.Textbox(label="Section list (numbered files)", value=sc.sections_text,
-                                                             placeholder="5, 8, 8, 7   or   1:1-5, 2:6-13", visible=sc.style == "sequence")
-                        comps[f"{sp}_order_by"] = gr.Dropdown(list(C.ORDER_CHOICES), value=sc.order_by, label="Order by", visible=sc.style == "sequence")
-                        comps[f"{sp}_compact_digits"] = gr.Radio([1, 2], value=sc.compact_digits, label="Digits of the section (compact)", visible=sc.style == "compact")
-            comps["clean_format"] = gr.Radio(["mp3", "wav"], value=st.intake.clean_format, label="Working format (WAV recommended; MP3 saves space)")
-            b_prev = gr.Button("Preview recording names", variant="primary")
-            table = gr.Dataframe(headers=TABLE_HEAD, value=[], type="array", interactive=True,
-                                 datatype=["str", "str", "number", "number", "bool", "str", "str"],
-                                 label="Name preview - edit speaker, section, dialogue or skip before preparing",
-                                 elem_classes=["studio-table"], column_widths=[120, 320, 110, 110, 90, 150, 180])
-            name_status = gr.Textbox(label="Naming status", lines=2, interactive=False)
-            name_log = gr.Textbox(label="Preview details", lines=2, interactive=False)
-            b_in = gr.Button("Prepare recordings")
-            prepare_status = gr.Textbox(label="Preparation status", lines=2, interactive=False)
+        steps = ["1 - Recordings & names", "2 - Dialogue order", "3 - Sound & export", "4 - Build & listen"]
+        workflow = gr.Radio(steps, value=steps[0], label="Workflow step", elem_id="workflow-nav")
+        tabs = gr.Tabs(selected=1, elem_id="studio-tabs")
+        with tabs:
+            with gr.Tab("1 - Recordings & names", id=1):
+                gr.Markdown("Choose each recording folder. Default names: **K11 / R11** = speaker, section 1, dialogue 1. Case does not matter. **a = 10, b = 11**, then c, d, and so on. **Kbb = section 11, dialogue 11.** Originals stay untouched.")
+                with gr.Row():
+                    for sp in C.SPEAKERS:
+                        sc = st.intake.speakers[sp]
+                        with gr.Column(elem_classes=["speaker-panel", sp]):
+                            gr.Markdown(f"### {sp.capitalize()}  /  {sp[0].upper()}")
+                            comps[f"{sp}_folder"] = gr.Textbox(label="Raw folder", value=sc.folder)
+                            bb = gr.Button(f"Browse {sp}'s folder")
+                            bb.click(browse_folder, None, comps[f"{sp}_folder"])
+                            comps[f"{sp}_style"] = gr.Dropdown(STYLE_LABELS, value=C.STYLE_TO_LABEL[sc.style], label="Naming style")
+                            comps[f"{sp}_pattern"] = gr.Textbox(label="Custom pattern (without extension)", value=sc.pattern, placeholder="s{section}{line} or {section}{line}", visible=sc.style == "custom")
+                            comps[f"{sp}_sections"] = gr.Textbox(label="Section list (numbered files)", value=sc.sections_text,
+                                                                 placeholder="5, 8, 8, 7   or   1:1-5, 2:6-13", visible=sc.style == "sequence")
+                            comps[f"{sp}_order_by"] = gr.Dropdown(list(C.ORDER_CHOICES), value=sc.order_by, label="Order by", visible=sc.style == "sequence")
+                            comps[f"{sp}_compact_digits"] = gr.Radio([1, 2], value=sc.compact_digits, label="Digits of the section (compact)", visible=sc.style == "compact")
+                comps["clean_format"] = gr.Radio(["mp3", "wav"], value=st.intake.clean_format, label="Working format (WAV recommended; MP3 saves space)")
+                b_prev = gr.Button("Preview recording names", variant="primary")
+                table = gr.Dataframe(headers=TABLE_HEAD, value=[], type="array", interactive=True,
+                                     datatype=["str", "str", "number", "number", "bool", "str", "str"],
+                                     label="Name preview - edit speaker, section, dialogue or skip before preparing",
+                                     elem_classes=["studio-table"], column_widths=[120, 320, 110, 110, 90, 150, 180])
+                name_status = gr.Textbox(label="Naming status", lines=2, interactive=False)
+                name_log = gr.Textbox(label="Preview details", lines=2, interactive=False)
+                b_in = gr.Button("Prepare recordings")
+                prepare_status = gr.Textbox(label="Preparation status", lines=2, interactive=False)
 
-        b_proj.click(browse_folder, None, project)
-        m = st.merge
-        script0, ov0 = load_project_texts(st.intake.project)
-        with gr.Tab("2 - Dialogue order"):
-            gr.Markdown("### Piece together the conversation\nPrepare your recordings first, then fill the order. Choose a section and move its clips into place. Clip IDs here omit the section: **K1** is Koroush's first dialogue in the selected section. Include each clip you want to hear; unlisted clips are left out.")
-            b_tpl = gr.Button("Fill order from prepared recordings", variant="primary")
-            section = gr.Dropdown(label="Section", choices=[], interactive=True)
-            pieces = gr.Dataframe(headers=["Clip in playback order"], value=[], type="array", interactive=True,
-                                  datatype=["str"], label="Section pieces - choose a clip below, then move up or down; dialogue IDs use decimal numbers")
-            selected_piece = gr.Dropdown(label="Clip to move or listen", choices=[], interactive=True)
-            b_listen = gr.Button('Listen to selected clip')
-            clip_audio = gr.Audio(label='Prepared recording (before merge processing)', type='filepath')
-            b_listen.click(listen_piece, [project, section, selected_piece], clip_audio)
-            selected_piece.change(lambda: None, None, clip_audio)
-            section.change(lambda: None, None, clip_audio)
-            project.change(lambda: None, None, clip_audio)
-            with gr.Row():
-                b_up = gr.Button("Move up")
-                b_down = gr.Button("Move down")
-                b_apply = gr.Button("Apply this section", variant="primary")
-            def select_piece(evt: gr.SelectData):
-                return _s(evt.value)
-            pieces.select(select_piece, None, selected_piece)
-            pieces.change(piece_choices, [pieces, selected_piece], selected_piece)
-            b_up.click(lambda r, i: move_piece(r, i, -1), [pieces, selected_piece], [pieces, selected_piece])
-            b_down.click(lambda r, i: move_piece(r, i, 1), [pieces, selected_piece], [pieces, selected_piece])
-            with gr.Accordion("Full episode order / custom script", open=False):
-                script = gr.Textbox(label="Exact clip order, one section per line", lines=8, value=script0,
-                                    placeholder="1: K1 R1 K2 R2\n2: R1 K1 R2 K2")
-                gr.Markdown("Use exact dialogue IDs to choose every piece. Legacy speaker turns such as `1: K R K R` are also accepted. Apply section edits before previewing. Preview uses your current unsaved script and timing controls.")
-            with gr.Accordion("Per-clip timing and gain", open=False):
-                ov = gr.Dataframe(headers=OV_HEADER, value=ov0 or [["", "", "", "", "", "", ""]], type="array",
-                                  interactive=True, label="Per-line overrides (overrides.csv)", elem_classes=["studio-table"], column_widths=[140] * len(OV_HEADER))
-            b_save = gr.Button("Save dialogue order and overrides")
-            order_status = gr.Textbox(label="Order status", lines=2, interactive=False)
-            script.change(order_sections, [script, section], section)
-            section.change(section_rows, [script, section], pieces)
-            b_apply.click(apply_section, [script, section, pieces], script)
-        with gr.Tab("3 - Sound & export"):
-            gr.Markdown("### Make the edit feel natural\nTrim empty edges, set comfortable pauses and balance both voices. Start here; open the detailed controls only when needed.")
-            comps["pacing"] = gr.Radio(list(C.PACING_MODES), value=m.pacing, label="Pacing (natural = varied, fixed = the two gaps below)")
-            comps["gap_diff_ms"] = gr.Slider(0, 1500, m.gap_diff_ms, step=10, label="Typical pause when the speaker changes (ms)")
-            comps["gap_same_ms"] = gr.Slider(0, 1500, m.gap_same_ms, step=10, label="Typical pause, same speaker (ms)")
-            comps["section_gap_ms"] = gr.Slider(0, 5000, m.section_gap_ms, step=100, label="Gap between sections (ms)")
-            comps["trim"] = gr.Checkbox(m.trim, label="Trim silence")
-            comps["room_tone"] = gr.Checkbox(m.room_tone, label="Fill pauses with room tone")
-            comps["match_loudness"] = gr.Checkbox(m.match_loudness, label="Match loudness")
-            comps["target_lufs"] = gr.Slider(-30, -10, m.target_lufs, step=0.5, label="Target loudness (LUFS)")
-            comps["export_mp3"] = gr.Checkbox(m.export_mp3, label="Export MP3")
-            comps["export_wav"] = gr.Checkbox(m.export_wav, label="Export WAV")
-            comps["export_full"] = gr.Checkbox(m.export_full, label="Export FULL episode")
-            comps["export_stems"] = gr.Checkbox(m.export_stems, label="Export one track per speaker")
-            with gr.Accordion("Export and matching details", open=False):
-                comps["starter"] = gr.Radio(list(C.SPEAKERS), value=m.starter, label="Starts each section")
-                comps["starter_exceptions"] = gr.Textbox(label="Starter exceptions", value=m.starter_exceptions, placeholder="3:reza, 7:koroush")
-                comps["variation_pct"] = gr.Slider(0, 60, m.variation_pct, step=1, label="Pause variation (%), fixed pacing only")
-                comps["sample_rate"] = gr.Radio(["44100", "48000"], value=str(m.sample_rate), label="Sample rate")
-                comps["comfort_noise"] = gr.Checkbox(m.comfort_noise, label="Soft room hiss when a clip has no quiet stretch (never dead silence)")
-                comps["loudness_mode"] = gr.Radio(list(C.LOUDNESS_MODES), value=m.loudness_mode, label="Loudness target (fixed = target below, match = the louder speaker)")
-                comps["match_tone"] = gr.Checkbox(m.match_tone, label="Bring the two voices' brightness closer (gentle)")
-                comps["max_tone_db"] = gr.Slider(0, 6, m.max_tone_db, step=0.5, label="Most brightness change (dB)")
-                comps["seed"] = gr.Number(m.seed, label="Seed", precision=0)
-                comps["wav_bit_depth"] = gr.Radio(["16", "24"], value=str(m.wav_bit_depth), label="WAV bit depth")
-                comps["marker_formats"] = gr.CheckboxGroup(["srt", "audacity", "csv"], value=m.marker_formats, label="Markers")
-                comps["srt_text_template"] = gr.Textbox(label="SRT text", value=m.srt_text_template)
-            with gr.Accordion("Natural pacing (used when pacing = natural)", open=False):
-                comps["pacing_profile"] = gr.Radio(list(C.PACING_CHOICES), value=m.pacing_profile, label="Profile (auto picks from line length)")
-                comps["overlap_amount"] = gr.Slider(0, 3, m.overlap_amount, step=0.1, label="Talk-over amount (0 = never)")
-                comps["overlap_max_ms"] = gr.Slider(0, 400, m.overlap_max_ms, step=10, label="Deepest talk-over (ms)")
-                comps["quick_reply_amount"] = gr.Slider(0, 3, m.quick_reply_amount, step=0.1, label="Quick replies")
-                comps["thinking_pause_amount"] = gr.Slider(0, 3, m.thinking_pause_amount, step=0.1, label="Thinking pauses")
-                comps["rhythm_memory"] = gr.Slider(0, 1.7, m.rhythm_memory, step=0.1, label="Rhythm memory (how long a fast or slow stretch lasts)")
-                comps["tempo_drift"] = gr.Slider(0, 3, m.tempo_drift, step=0.1, label="Tempo drift over the episode (0 = steady)")
-                comps["min_gap_ms"] = gr.Slider(0, 500, m.min_gap_ms, step=5, label="Shortest pause (ms)")
-            with gr.Accordion("Advanced", open=False):
-                for k, lab in [("lead_pad_ms", "Lead pad (ms)"), ("tail_pad_ms", "Tail pad (ms)"), ("edge_fade_ms", "Edge fade (ms)"),
-                               ("trim_threshold_db", "Trim threshold below peak (dB)"), ("trim_floor_margin_db", "Trim margin above noise (dB)"),
-                               ("room_tone_min_ms", "Room tone min (ms)"), ("room_tone_max_ms", "Room tone max (ms)"),
-                               ("peak_ceiling_dbfs", "Peak ceiling (dBFS)"), ("max_gain_db", "Max gain (dB)")]:
-                    comps[k] = gr.Number(getattr(m, k), label=lab)
-                comps["mp3_bitrate"] = gr.Textbox(label="MP3 bitrate", value=m.mp3_bitrate)
-                comps["dup_policy"] = gr.Radio(["newest", "oldest", "manual"], value=st.intake.dup_policy, label="Retakes: keep")
-                comps["verify_tolerance_s"] = gr.Number(st.intake.verify_tolerance_s, label="Verify tolerance (s)")
-                comps["intake_mode"] = gr.Radio(list(C.INTAKE_MODES), value=st.intake.intake_mode, label="Intake: replace matching lines safely, or add only new lines")
-                comps["qc_long_silence_s"] = gr.Number(m.qc_long_silence_s, label="Warn: silence inside a line longer than (s)")
-                comps["qc_level_outlier_db"] = gr.Number(m.qc_level_outlier_db, label="Warn: line louder/quieter than the speaker's typical by (dB)")
-                comps["qc_short_line_s"] = gr.Number(m.qc_short_line_s, label="Warn: line shorter than (s)")
-                comps["qc_long_line_s"] = gr.Number(m.qc_long_line_s, label="Warn: line longer than (s)")
-        with gr.Tab("4 - Build & listen"):
-            with gr.Row():
-                b_mg = gr.Button("Export episode")
-                b_all = gr.Button("Prepare & export", variant="primary")
-                b_plan = gr.Button("Merge plan preview")
-                b_chk = gr.Button("Check material")
-            warn = gr.Textbox(label="Status & issues", lines=4)
-            log = gr.Textbox(label="Run report", lines=10)
-            plan = gr.Dataframe(headers=PLAN_HEAD, value=[], type="array", interactive=False, label="Merge plan", elem_classes=["studio-table"], column_widths=[160] * len(PLAN_HEAD))
-            files = gr.Dropdown([], label="Merged files")
-            audio = gr.Audio(label="Listen", type="filepath")
-            files.change(lambda p: p, files, audio)
-            b_open = gr.Button("Open project folder")
-            b_open.click(open_folder, project, None)
+            b_proj.click(browse_folder, None, project)
+            m = st.merge
+            script0, ov0 = load_project_texts(st.intake.project)
+            with gr.Tab("2 - Dialogue order", id=2):
+                gr.Markdown("### Piece together the conversation\nPrepare your recordings first, then fill the order. Choose a section and move its clips into place. Clip IDs here omit the section: **K1** is Koroush's first dialogue in the selected section. Include each clip you want to hear; unlisted clips are left out.")
+                b_tpl = gr.Button("Fill order from prepared recordings", variant="primary")
+                section = gr.Dropdown(label="Section", choices=[], interactive=True)
+                board = gr.HTML(render_board([], [], None), label="Visual section editor")
+                bridge = gr.Textbox(value="", elem_id="timeline-bridge", show_label=False, container=False)
+                board_history = gr.State({})
+                gr.Markdown("Drag the waveform cards into conversation order. The arrows also work on touch screens. Waveforms show prepared recordings before sound processing.")
+                with gr.Accordion("Table editor / manual clip IDs", open=False):
+                    pieces = gr.Dataframe(headers=["Clip in playback order"], value=[], type="array", interactive=True,
+                                      datatype=["str"], label="Section pieces - choose a clip below, then move up or down; dialogue IDs use decimal numbers")
+                selected_piece = gr.Dropdown(label="Selected clip", choices=[], interactive=True)
+                b_listen = gr.Button('Listen to selected clip')
+                clip_audio = gr.Audio(label='Prepared recording (before merge processing)', type='filepath')
+                b_listen.click(listen_piece, [project, section, selected_piece], clip_audio)
+                selected_piece.change(lambda: None, None, clip_audio)
+                section.change(lambda: None, None, clip_audio)
+                project.change(lambda: None, None, clip_audio)
+                with gr.Row():
+                    b_up = gr.Button("Move up")
+                    b_down = gr.Button("Move down")
+                    b_apply = gr.Button("Apply this section", variant="primary")
+                def select_piece(evt: gr.SelectData):
+                    return _s(evt.value)
+                pieces.select(select_piece, None, selected_piece)
+                pieces.change(piece_choices, [pieces, selected_piece], selected_piece)
+                b_up.click(lambda r, i: move_piece(r, i, -1), [pieces, selected_piece], [pieces, selected_piece])
+                b_down.click(lambda r, i: move_piece(r, i, 1), [pieces, selected_piece], [pieces, selected_piece])
+                with gr.Accordion("Full episode order / custom script", open=False):
+                    script = gr.Textbox(label="Exact clip order, one section per line", lines=8, value=script0,
+                                        placeholder="1: K1 R1 K2 R2\n2: R1 K1 R2 K2")
+                    gr.Markdown("Use exact dialogue IDs to choose every piece. Legacy speaker turns such as `1: K R K R` are also accepted. Apply section edits before previewing. Preview uses your current unsaved script and timing controls.")
+                with gr.Accordion("Per-clip timing and gain", open=False):
+                    ov = gr.Dataframe(headers=OV_HEADER, value=ov0 or [["", "", "", "", "", "", ""]], type="array",
+                                      interactive=True, label="Per-line overrides (overrides.csv)", elem_classes=["studio-table"], column_widths=[140] * len(OV_HEADER))
+                with gr.Row():
+                    b_render_section = gr.Button("Render section preview", variant="primary")
+                    b_save = gr.Button("Save dialogue order and overrides")
+                section_audio = gr.Audio(label="Rendered section ? current order and sound settings", type="numpy")
+                section_report = gr.Textbox(label="Section preview status", lines=3, interactive=False)
+                order_status = gr.Textbox(label="Order status", lines=2, interactive=False)
+                bridge.input(timeline_edit, [bridge, project, script, section, selected_piece, board_history],
+                             [script, selected_piece, board_history, order_status], concurrency_id="timeline-edit", concurrency_limit=1)
+                script.change(timeline_view, [project, script, section, selected_piece], board)
+                section.change(timeline_view, [project, script, section, selected_piece], board)
+                selected_piece.change(timeline_view, [project, script, section, selected_piece], board)
+                project.change(lambda: {}, None, board_history)
+                script.change(order_sections, [script, section], section)
+                section.change(section_rows, [script, section], pieces)
+                b_apply.click(apply_section, [script, section, pieces], script)
+            with gr.Tab("3 - Sound & export", id=3):
+                gr.Markdown("### Make the edit feel natural\nTrim empty edges, set comfortable pauses and balance both voices. Start here; open the detailed controls only when needed.")
+                with gr.Row():
+                    sound_preset = gr.Dropdown(list(SOUND_PRESETS), value="Natural conversation", label="Sound starting point", scale=3)
+                    b_preset = gr.Button("Apply sound preset", scale=1)
+                preset_status = gr.Markdown("Apply a starting point, then adjust any control. Your saved settings stay in place until you apply a preset.")
+                comps["pacing"] = gr.Radio(list(C.PACING_MODES), value=m.pacing, label="Pacing (natural = varied, fixed = the two gaps below)")
+                comps["gap_diff_ms"] = gr.Slider(0, 1500, m.gap_diff_ms, step=10, label="Typical pause when the speaker changes (ms)")
+                comps["gap_same_ms"] = gr.Slider(0, 1500, m.gap_same_ms, step=10, label="Typical pause, same speaker (ms)")
+                comps["section_gap_ms"] = gr.Slider(0, 5000, m.section_gap_ms, step=100, label="Gap between sections (ms)")
+                comps["trim"] = gr.Checkbox(m.trim, label="Trim silence")
+                comps["room_tone"] = gr.Checkbox(m.room_tone, label="Fill pauses with room tone")
+                comps["match_loudness"] = gr.Checkbox(m.match_loudness, label="Match loudness")
+                comps["target_lufs"] = gr.Slider(-30, -10, m.target_lufs, step=0.5, label="Target loudness (LUFS)")
+                comps["export_mp3"] = gr.Checkbox(m.export_mp3, label="Export MP3")
+                comps["export_wav"] = gr.Checkbox(m.export_wav, label="Export WAV")
+                comps["export_full"] = gr.Checkbox(m.export_full, label="Export FULL episode")
+                comps["export_stems"] = gr.Checkbox(m.export_stems, label="Export one track per speaker")
+                with gr.Accordion("Export and matching details", open=False):
+                    comps["starter"] = gr.Radio(list(C.SPEAKERS), value=m.starter, label="Starts each section")
+                    comps["starter_exceptions"] = gr.Textbox(label="Starter exceptions", value=m.starter_exceptions, placeholder="3:reza, 7:koroush")
+                    comps["variation_pct"] = gr.Slider(0, 60, m.variation_pct, step=1, label="Pause variation (%), fixed pacing only")
+                    comps["sample_rate"] = gr.Radio(["44100", "48000"], value=str(m.sample_rate), label="Sample rate")
+                    comps["comfort_noise"] = gr.Checkbox(m.comfort_noise, label="Soft room hiss when a clip has no quiet stretch (never dead silence)")
+                    comps["loudness_mode"] = gr.Radio(list(C.LOUDNESS_MODES), value=m.loudness_mode, label="Loudness target (fixed = target below, match = the louder speaker)")
+                    comps["match_tone"] = gr.Checkbox(m.match_tone, label="Bring the two voices' brightness closer (gentle)")
+                    comps["max_tone_db"] = gr.Slider(0, 6, m.max_tone_db, step=0.5, label="Most brightness change (dB)")
+                    comps["seed"] = gr.Number(m.seed, label="Seed", precision=0)
+                    comps["wav_bit_depth"] = gr.Radio(["16", "24"], value=str(m.wav_bit_depth), label="WAV bit depth")
+                    comps["marker_formats"] = gr.CheckboxGroup(["srt", "audacity", "csv"], value=m.marker_formats, label="Markers")
+                    comps["srt_text_template"] = gr.Textbox(label="SRT text", value=m.srt_text_template)
+                with gr.Accordion("Natural pacing (used when pacing = natural)", open=False):
+                    comps["pacing_profile"] = gr.Radio(list(C.PACING_CHOICES), value=m.pacing_profile, label="Profile (auto picks from line length)")
+                    comps["overlap_amount"] = gr.Slider(0, 3, m.overlap_amount, step=0.1, label="Talk-over amount (0 = never)")
+                    comps["overlap_max_ms"] = gr.Slider(0, 400, m.overlap_max_ms, step=10, label="Deepest talk-over (ms)")
+                    comps["quick_reply_amount"] = gr.Slider(0, 3, m.quick_reply_amount, step=0.1, label="Quick replies")
+                    comps["thinking_pause_amount"] = gr.Slider(0, 3, m.thinking_pause_amount, step=0.1, label="Thinking pauses")
+                    comps["rhythm_memory"] = gr.Slider(0, 1.7, m.rhythm_memory, step=0.1, label="Rhythm memory (how long a fast or slow stretch lasts)")
+                    comps["tempo_drift"] = gr.Slider(0, 3, m.tempo_drift, step=0.1, label="Tempo drift over the episode (0 = steady)")
+                    comps["min_gap_ms"] = gr.Slider(0, 500, m.min_gap_ms, step=5, label="Shortest pause (ms)")
+                with gr.Accordion("Advanced", open=False):
+                    for k, lab in [("lead_pad_ms", "Lead pad (ms)"), ("tail_pad_ms", "Tail pad (ms)"), ("edge_fade_ms", "Edge fade (ms)"),
+                                   ("trim_threshold_db", "Trim threshold below peak (dB)"), ("trim_floor_margin_db", "Trim margin above noise (dB)"),
+                                   ("room_tone_min_ms", "Room tone min (ms)"), ("room_tone_max_ms", "Room tone max (ms)"),
+                                   ("peak_ceiling_dbfs", "Peak ceiling (dBFS)"), ("max_gain_db", "Max gain (dB)")]:
+                        comps[k] = gr.Number(getattr(m, k), label=lab)
+                    comps["mp3_bitrate"] = gr.Textbox(label="MP3 bitrate", value=m.mp3_bitrate)
+                    comps["dup_policy"] = gr.Radio(["newest", "oldest", "manual"], value=st.intake.dup_policy, label="Retakes: keep")
+                    comps["verify_tolerance_s"] = gr.Number(st.intake.verify_tolerance_s, label="Verify tolerance (s)")
+                    comps["intake_mode"] = gr.Radio(list(C.INTAKE_MODES), value=st.intake.intake_mode, label="Intake: replace matching lines safely, or add only new lines")
+                    comps["qc_long_silence_s"] = gr.Number(m.qc_long_silence_s, label="Warn: silence inside a line longer than (s)")
+                    comps["qc_level_outlier_db"] = gr.Number(m.qc_level_outlier_db, label="Warn: line louder/quieter than the speaker's typical by (dB)")
+                    comps["qc_short_line_s"] = gr.Number(m.qc_short_line_s, label="Warn: line shorter than (s)")
+                    comps["qc_long_line_s"] = gr.Number(m.qc_long_line_s, label="Warn: line longer than (s)")
+            with gr.Tab("4 - Build & listen", id=4):
+                with gr.Row():
+                    b_mg = gr.Button("Export episode")
+                    b_all = gr.Button("Prepare & export", variant="primary")
+                    b_plan = gr.Button("Merge plan preview")
+                    b_chk = gr.Button("Check material")
+                warn = gr.Textbox(label="Status & issues", lines=4)
+                log = gr.Textbox(label="Run report", lines=10)
+                plan = gr.Dataframe(headers=PLAN_HEAD, value=[], type="array", interactive=False, label="Merge plan", elem_classes=["studio-table"], column_widths=[160] * len(PLAN_HEAD))
+                files = gr.Dropdown([], label="Merged files")
+                audio = gr.Audio(label="Listen", type="filepath")
+                files.change(lambda p: p, files, audio)
+                b_open = gr.Button("Open project folder")
+                b_open.click(open_folder, project, None)
+        workflow.change(lambda value: gr.update(selected=int(value[0])), workflow, tabs, queue=False)
         ins = [comps[k] for k in KEYS] + [script, ov, table]
+        preset_keys = list(dict.fromkeys(key for preset in SOUND_PRESETS.values() for key in preset))
+        def apply_preset(label):
+            values = SOUND_PRESETS[label]
+            return [values.get(key, gr.update()) for key in preset_keys] + ["Applied **" + label + "**. Adjust any control below to customize it."]
+        b_preset.click(apply_preset, sound_preset, [comps[key] for key in preset_keys] + [preset_status])
         processing = dict(concurrency_id="episode-processing", concurrency_limit=1)
+        for control in [script, ov, section] + [comps[key] for key in KEYS]:
+            control.change(lambda: (None, "Order or settings changed. Render a fresh section preview."),
+                           None, [section_audio, section_report], queue=False)
+        b_render_section.click(_safe(do_section_preview, 2, 1, 1),
+                               [comps[k] for k in KEYS] + [script, ov, section],
+                               [section_audio, section_report], **processing)
         b_prev.click(_safe(do_preview, 3, 1, 2), ins, [table, name_status, name_log], **processing)
         b_in.click(_safe(do_intake, 3, 0, 1), ins, [prepare_status, name_log, files], **processing)
         b_mg.click(_safe(do_merge, 3, 0, 1), ins, [warn, log, files], **processing)
@@ -512,6 +656,7 @@ def create_interface() -> "gr.Blocks":
             return text, overrides, [], gr.update(choices=[], value=None), None
         project.change(change_project, project, [script, ov, table, files, audio])
         demo.load(order_sections, [script, section], section)
+        demo.load(timeline_view, [project, script, section, selected_piece], board)
         for sp in C.SPEAKERS:
             comps[f'{sp}_style'].change(naming_visibility, comps[f'{sp}_style'],
                                       [comps[f'{sp}_{key}'] for key in ('pattern', 'sections', 'order_by', 'compact_digits')])

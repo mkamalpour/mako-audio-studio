@@ -20,13 +20,15 @@ New matching replacements are staged and verified before old matching files (inc
 # Exact clip IDs: decimal dialogue numbers within the section
 1: K2 R1 K1 R2
 b: R11 K11
+# Exclude a section while keeping its recordings available
+5: -
 # Legacy speaker-turn grammar
 3: K R R K R
 4: (K R)*3 K
 default: K R
 ```
 
-Exact section arrangements use every listed clip once in the specified order. Omitted material is excluded with an issue, missing references warn, duplicate IDs are rejected. Legacy turn sequences consume the next line number for that speaker; unreferenced extras are appended with warnings. Invalid script lines are reported; export refuses to proceed until they are fixed. Section order is numerical; within-section precedence is explicit script, starter exceptions, default pattern, alternating starter. The UI editor manipulates a selected section's list through row moves and Apply; Save persists script.txt. A fresh template writes script.txt; if present it writes script.suggested.txt. Do not mix bare turns and exact IDs in one section.
+Exact section arrangements use every listed clip once in the specified order. Omitted material is excluded with an issue, missing references warn, duplicate IDs are rejected. Legacy turn sequences consume the next line number for that speaker; unreferenced extras are appended with warnings. Invalid script lines are reported; export refuses to proceed until they are fixed. Section order is numerical; within-section precedence is explicit script, starter exceptions, default pattern, alternating starter. The visual editor manipulates a selected section through drag/drop, keyboard/touch moves, remove/reinsert, and session undo/redo. Card actions immediately update the in-memory script; the advanced table still uses Apply. A bare hyphen explicitly excludes an entire section; deleting its script line would restore automatic ordering. Save persists script.txt. A fresh template writes script.txt; if present it writes script.suggested.txt. Do not mix bare turns and exact IDs in one section.
 
 ## Other controls
 
@@ -40,7 +42,7 @@ Exact section arrangements use every listed clip once in the specified order. Om
 
 Merge decodes to mono float32 at 48 kHz by default (44.1 kHz optional). It trims edges conservatively with lead/tail padding and fades, optionally fills gaps with captured room tone or quiet synthesized noise, optionally applies gentle tone matching, then uses a fixed loudness gain per speaker with sample-peak and maximum-gain bounds. Natural pacing is seeded; fixed gaps are available. Per-line pause/gain/trim overrides take priority. Tone matching does not repair bad recordings. Peak protection is sample-based, not a true-peak limiter; overlapping signals can exceed full scale and are reported. WAV export defaults to 24-bit, MP3 to 320k. Identical inputs/settings/seed are tested for identical decoded WAV in the verified environment; cross-version binary identity is not promised.
 
-GUI preview and QC validate current applied script/timing edits in memory, write no episode controls, and may decode all audio. CLI preview/QC use saved controls. Script/template and processing actions do write controls. GUI processing actions share a queue to prevent concurrent preparation/export/control writes. Writers from separate processes remain unsupported. Full-run rollback, recursive source uploads, drag-and-drop ordering, individual take auditioning, denoising, transcription, Persian UI, and incremental rendering are not implemented. Decoded clips remain in RAM. WAV files can consume significant disk space.
+GUI preview and QC validate current applied script/timing edits in memory, write no episode controls, and may decode all audio. CLI preview/QC use saved controls. Script/template and processing actions do write controls. GUI processing actions share a queue to prevent concurrent preparation/export/control writes. Writers from separate processes remain unsupported. Full-run rollback, recursive source uploads, individual retake auditioning, denoising, transcription, Persian UI, and incremental rendering are not implemented. Decoded clips remain in RAM. WAV files can consume significant disk space.
 
 ## Outputs and checks
 
@@ -49,3 +51,12 @@ A merge writes a new `merged/<timestamp>[_N]/` directory: section files, optiona
 Warnings include missing/excluded lines, duplicates, unreadable media, near silence, clipping, long silence, unusual line length, gain limits and suspicious trims. Reports distinguish stage failure from per-file errors. GUI binds to loopback with share disabled; local paths are intended for a trusted single-user workstation. Source recordings, output audio, settings and credentials must remain excluded from Git.
 
 Validation: automated synthetic tests plus browser workflow checks are described in the final delivery. Actual voice quality and Filmora subtitle alignment require manual checks with the owner's material. No universal runtime compatibility is claimed.
+
+
+## Visual editor and audition
+
+`timeline.py` reads prepared clips without writing controls, caches up to 256 small 64-bin waveform envelopes by resolved path/size/modification time, and shows decode failures as card errors. Waveforms show source amplitude, not processed samples or a time-scaled DAW edit. Removed clips remain in the available pool. Corrupt clips retain their labels/errors; originals are not modified.
+
+`timeline_ui.py` supplies escaped HTML, local CSS, and delegated browser events. The Gradio bridge validates the episode context, script revision, selected section, and clip identities before applying actions. Stale events are rejected. Keyboard controls and explicit buttons remain available without dragging. Undo/redo is session state, not persisted history. Project changes reset it.
+
+Section audition calls the same merge engine with `preview_section` and forces read-only mode. Global gains, pacing profile, and rhythm are computed from the current full episode, then only the requested section is rendered to 16-bit playback data. It creates no merge folder or control file. Export WAV may be 24-bit; preview comparison allows integer quantization error. Processing can take time for long episodes. Changing order/settings clears old preview playback. Invalid section selectors cannot trigger an export. Per-clip overrides take precedence over sound presets, and Just join clips does not recover audio already trimmed in a source file.
