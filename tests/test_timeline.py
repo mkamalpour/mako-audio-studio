@@ -159,3 +159,16 @@ def test_invalid_preview_selector_cannot_trigger_export(tmp_path, monkeypatch):
     monkeypatch.setattr(ui, 'run_merge', forbidden)
     with pytest.raises(ValueError, match='valid section'):
         ui.do_section_preview(*([data[key] for key in ui.KEYS] + ['', [], 'invalid']))
+
+
+def test_rebuilding_template_preserves_excluded_sections(tmp_path):
+    from mako_pipeline.merge import script_template
+    from mako_pipeline.script import parse_script
+    clean = tmp_path / 'clean'
+    clean.mkdir()
+    make(clean / 'K11.wav', dur=.4)
+    make(clean / 'K21.wav', dur=.4)
+    (tmp_path / 'script.txt').write_text('1: -\n2: K1', encoding='utf-8')
+    _, text = script_template(tmp_path, Settings().merge)
+    parsed = parse_script(text)
+    assert not parsed.issues and parsed.exact[1] == []

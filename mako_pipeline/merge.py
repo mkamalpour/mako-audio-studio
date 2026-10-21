@@ -922,7 +922,7 @@ def script_template(project, cfg: MergeConfig) -> Tuple[Path, str]:
              "# Reorder IDs freely. Omitted IDs are excluded from explicit section arrangements.",
              "# Edit only the sections that are not strictly alternating, then run Merge."]
     for sec in sorted(order):
-        seq = " ".join(("K" if i.speaker == "koroush" else "R") + str(i.line) for i in order[sec])
+        seq = " ".join(("K" if i.speaker == "koroush" else "R") + str(i.line) for i in order[sec]) or '-'
         lines.append(f"{sec_code(sec)}: {seq}")
     target = project / C.SCRIPT_FILE
     if target.exists():

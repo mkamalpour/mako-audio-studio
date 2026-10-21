@@ -22,7 +22,7 @@ __pycache__/
 *.pfx
 mako_settings.json
 script.txt
-script.suggested.txt
+script.suggested*.txt
 overrides.csv
 rename_overrides.csv
 clean/
