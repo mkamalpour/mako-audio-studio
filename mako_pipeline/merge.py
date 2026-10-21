@@ -21,9 +21,9 @@ from .dsp import (apply_tilt, clip_levels, find_room_tone, longest_silence_ms, m
                   measure_lufs, peak_db, speech_edges, tilt_db, tone_spectrum, trim_clip)
 from .ffmpeg import (FFmpegMissing, decode_audio, encode_audio, encode_raw, find_ffmpeg)
 from .names import build_clean_name, parse_clean, parse_sec_code, sec_code, speaker_from_token
-from .overrides import Overrides, load_overrides, unused_issues
+from .overrides import Overrides, load_overrides, unused_issues, parse_overrides
 from .report import Issue, Report
-from .script import SPEAKER_OF, ScriptResult, load_script
+from .script import SPEAKER_OF, ScriptResult, load_script, parse_script
 from .util import sha256_file, stamp_folder, utc_iso, write_text_atomic, unique_path
 
 Progress = Optional[Callable[[float, str], None]]
@@ -607,7 +607,8 @@ def _encode(arr_or_raw, n, sr, out: Path, fmt: str, cfg: MergeConfig, raw: bool)
         encode_audio(arr_or_raw, sr, out, fmt, cfg.mp3_bitrate, cfg.wav_bit_depth)
 
 
-def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: bool = False) -> MergeResult:
+def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: bool = False,
+              script_text: Optional[str] = None, override_text: Optional[str] = None) -> MergeResult:
     """Merge clean/ into merged/<timestamp>/. With dry_run nothing is written (merge plan preview)."""
     rep = Report(stage="merge")
     res = MergeResult(rep)
@@ -632,12 +633,16 @@ def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: boo
     if not scan:
         rep.fail("E_NO_CLEAN_FILES", f"No usable files in {clean}. Expected names like S1_3_koroush.mp3.")
         return res
-    script, _ = load_script(project / C.SCRIPT_FILE)
+    if script_text is None:
+        script, _ = load_script(project / C.SCRIPT_FILE)
+    else:
+        script = parse_script(script_text)
     if script and script.issues:
         rep.issues += script.issues
         rep.fail("E_BAD_SETTINGS", "Fix the reported script errors before merging; no audio was exported.")
         return res
-    ov, ov_issues = load_overrides(project / C.OVERRIDES_FILE)
+    ov, ov_issues = (load_overrides(project / C.OVERRIDES_FILE) if override_text is None
+                     else parse_overrides(override_text))
     rep.issues += ov_issues
     validate_scan(scan, ignored, rep)
     order = build_order(scan, cfg, script, rep)

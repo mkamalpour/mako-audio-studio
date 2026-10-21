@@ -79,8 +79,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.project:
         print("--project is required", file=sys.stderr)
         return 2
-    st: Settings = resolve_settings(args.project, _overrides(args))
     try:
+        st: Settings = resolve_settings(args.project, _overrides(args))
         validate_intake(st.intake)
         st.merge.validate()
     except ValueError as e:

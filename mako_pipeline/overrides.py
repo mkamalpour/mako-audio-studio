@@ -81,6 +81,13 @@ def load_overrides(path) -> Tuple[Overrides, List[Issue]]:
     if not p.is_file():
         return ov, issues
     text = p.read_text(encoding="utf-8-sig", errors="replace")
+    return parse_overrides(text, p.name)
+
+
+def parse_overrides(text: str, source: str = 'overrides.csv') -> Tuple[Overrides, List[Issue]]:
+    """Validate controls in memory, without touching an episode folder."""
+    ov = Overrides({}, {})
+    issues: List[Issue] = []
     body = "\n".join(ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
     for n, rec in enumerate(csv.reader(io.StringIO(body)), 1):
         if not rec:
@@ -107,7 +114,7 @@ def load_overrides(path) -> Tuple[Overrides, List[Issue]]:
                 _bool(tone) if tone else None)
         except ValueError as e:
             issues.append(Issue("W_OVERRIDE_INVALID", "warning",
-                                f"{p.name} row {n}: {e}. The row is ignored."))
+                                f"{source} row {n}: {e}. The row is ignored."))
             continue
         if line_t:
             ov.line[(sec, int(line_t), spk)] = o
@@ -133,8 +140,8 @@ def unused_issues(ov: Overrides, existing: Set[Tuple[int, int, str]],
     return out
 
 
-def save_overrides(path, rows: List[List[str]]) -> None:
-    """Write overrides.csv from table rows (empty rows are dropped)."""
+def overrides_text(rows: List[List[str]]) -> str:
+    """Serialize table rows without writing to disk."""
     out = io.StringIO()
     out.write("# Per-line overrides. Blank cell = inherit. A row with no line applies to the whole section.\n"
               "# pause_before_ms is exact; a negative value (down to -400) makes the line start that much\n"
@@ -142,13 +149,18 @@ def save_overrides(path, rows: List[List[str]]) -> None:
     w = csv.writer(out, lineterminator="\n")
     w.writerow(HEADER)
     for r in rows:
-        cells = ["" if c is None else str(c).strip() for c in r][:7]
+        cells = ["" if c is None or (isinstance(c, float) and math.isnan(c))
+                 else str(c).strip() for c in r][:7]
         cells += [""] * (7 - len(cells))
-        cells = ["" if c.lower() == "nan" else c for c in cells]
         if any(cells):
             w.writerow(cells)
+    return out.getvalue()
+
+
+def save_overrides(path, rows: List[List[str]]) -> None:
+    """Write overrides.csv from table rows (empty rows are dropped)."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, out.getvalue())
+    write_text_atomic(path, overrides_text(rows))
 
 
 def read_rows(path) -> List[List[str]]:

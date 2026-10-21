@@ -156,3 +156,67 @@ def test_full_source_path_disambiguates_shared_names(tmp_path):
     plan = plan_intake(cfg, [RenameRow(source, 'include', 'reza', 2, 3)])
     assert {(i.folder_speaker, i.speaker, i.section, i.line) for i in plan.ok_items()} == {
         ('koroush', 'reza', 2, 3), ('reza', 'reza', 1, 1)}
+
+
+@pytest.mark.parametrize('settings', [
+    {'gap_diff_ms': 99999}, {'seed': 1.5}, {'seed': float('inf')},
+    {'sample_rate': 22050}, {'koroush_style': 'unknown'}])
+def test_explicit_settings_are_not_silently_replaced(settings):
+    from mako_pipeline.config import settings_from_dict
+    with pytest.raises(ValueError):
+        settings_from_dict(settings, strict=True)
+
+
+def test_invalid_cli_setting_is_rejected(tmp_path, capsys):
+    assert cli.main(['preview', '--project', str(tmp_path), '--gap-diff', '99999']) == 2
+    assert 'gap_diff_ms' in capsys.readouterr().err
+
+
+def test_form_preview_uses_unsaved_order_and_gain_without_writes(tmp_path):
+    from mako_pipeline.config import Settings, settings_to_dict
+    from mako_pipeline.ui import KEYS, do_plan
+    from mako_pipeline.constants import STYLE_TO_LABEL
+    clean = tmp_path / 'clean'
+    clean.mkdir()
+    for token in ('K11', 'R11'):
+        make(clean / (token + '.wav'), dur=.7)
+    saved = tmp_path / 'script.txt'
+    saved.write_text('1: K1 R1', encoding='utf-8')
+    st = Settings()
+    st.intake.project = str(tmp_path)
+    st.merge.match_loudness = False
+    st.merge.pacing = 'fixed'
+    st.merge.variation_pct = 0
+    data = settings_to_dict(st)
+    for speaker in ('koroush', 'reza'):
+        data[speaker + '_style'] = STYLE_TO_LABEL[data[speaker + '_style']]
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    rows, _, _ = do_plan(*([data[k] for k in KEYS] + ['1: R1 K1', [['1','1','koroush','250','3','','']], []]))
+    assert [row[1] for row in rows] == ['R11.wav', 'K11.wav']
+    assert float(rows[1][3]) == 250 and float(rows[1][4]) == 3
+    assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()} == before
+
+
+def test_listen_resolves_only_prepared_clip_ids(tmp_path):
+    from mako_pipeline.ui import listen_piece
+    clean = tmp_path / 'clean'
+    clean.mkdir()
+    clip = clean / 'Kbb.wav'
+    clip.write_bytes(b'path resolution does not decode audio')
+    assert listen_piece(str(tmp_path), 'b', 'K11') == str(clip.resolve())
+    with pytest.raises(Exception, match='exact clip ID'):
+        listen_piece(str(tmp_path), 'b', '../../outside.wav')
+
+
+@pytest.mark.parametrize('gain', ['1000', 'NaN', 'inf'])
+def test_invalid_form_override_does_not_replace_saved_controls(tmp_path, gain):
+    from mako_pipeline.config import Settings
+    from mako_pipeline.ui import _save_texts
+    st = Settings()
+    st.intake.project = str(tmp_path)
+    script = tmp_path / 'script.txt'
+    script.write_text('1: K1', encoding='utf-8')
+    with pytest.raises(ValueError, match='Invalid timing or gain'):
+        _save_texts(st, '1: R1', [['1','1','koroush','',gain,'','']])
+    assert script.read_text() == '1: K1'
+    assert not (tmp_path / 'overrides.csv').exists()

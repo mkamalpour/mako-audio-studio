@@ -1,7 +1,14 @@
 """Keep verification independent of personal episode settings."""
 import pytest
+from pathlib import Path
 
 from mako_pipeline import config, ffmpeg
+
+
+def pytest_configure(config):
+    # pytest creates basetemp itself, but expects its parent to exist on a fresh checkout.
+    if config.option.basetemp:
+        Path(config.option.basetemp).parent.mkdir(parents=True, exist_ok=True)
 
 
 @pytest.fixture(autouse=True)

@@ -184,7 +184,10 @@ def _coerce(value: Any, default: Any) -> Any:
             raise ValueError(value)
         return bool(value)
     if isinstance(default, int):
-        return int(float(value))
+        number = float(value)
+        if not number.is_integer():
+            raise ValueError('must be a finite whole number')
+        return int(number)
     if isinstance(default, float):
         return float(value)
     if isinstance(default, list):
@@ -199,16 +202,17 @@ def _speaker_keys(sp: str) -> Dict[str, str]:
             f"{sp}_sections": "sections_text", f"{sp}_compact_digits": "compact_digits", f"{sp}_pattern": "pattern"}
 
 
-def settings_from_dict(d: Dict[str, Any], base: Optional[Settings] = None) -> Settings:
-    """Apply a flat dict onto `base` (or defaults). Unknown keys and bad values are ignored."""
+def settings_from_dict(d: Dict[str, Any], base: Optional[Settings] = None, *, strict: bool = False) -> Settings:
+    """Apply flat settings. File values recover to defaults; explicit strict values raise."""
     s = base or Settings()
     m_defaults = MergeConfig()
     for f in fields(MergeConfig):
         if f.name in d:
             try:
                 setattr(s.merge, f.name, _coerce(d[f.name], getattr(m_defaults, f.name)))
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError, OverflowError) as e:
+                if strict:
+                    raise ValueError(f'{f.name}: invalid value {d[f.name]!r}') from e
     for k in ("project", "clean_format", "dup_policy", "mp3_bitrate", "intake_mode"):
         if k in d:
             try:
@@ -218,8 +222,9 @@ def settings_from_dict(d: Dict[str, Any], base: Optional[Settings] = None) -> Se
     if "verify_tolerance_s" in d:
         try:
             s.intake.verify_tolerance_s = float(d["verify_tolerance_s"])
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError, OverflowError) as e:
+            if strict:
+                raise ValueError('verify_tolerance_s must be a number') from e
     if "mp3_bitrate" in d:
         s.merge.mp3_bitrate = str(d["mp3_bitrate"])
     for sp in C.SPEAKERS:
@@ -228,10 +233,15 @@ def settings_from_dict(d: Dict[str, Any], base: Optional[Settings] = None) -> Se
             if key in d:
                 try:
                     setattr(sc, attr, _coerce(d[key], getattr(SpeakerCfg(), attr)))
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError, OverflowError) as e:
+                    if strict:
+                        raise ValueError(f'{key}: invalid value {d[key]!r}') from e
     s.intake.mp3_bitrate = s.merge.mp3_bitrate
-    _sanitize(s)
+    if strict:
+        validate_intake(s.intake)
+        s.merge.validate()
+    else:
+        _sanitize(s)
     return s
 
 
@@ -297,7 +307,7 @@ def resolve_settings(project: str = "", overrides: Optional[Dict[str, Any]] = No
     if proj:
         s = settings_from_dict(load_json(Path(proj) / C.SETTINGS_FILE), s)
     if overrides:
-        s = settings_from_dict(overrides, s)
+        s = settings_from_dict(overrides, s, strict=True)
     if project:
         s.intake.project = project
     return s

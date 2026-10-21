@@ -18,8 +18,8 @@ from .config import (Settings, launcher_dir, resolve_settings, save_settings, se
 from .ffmpeg import check_environment
 from .intake import (load_rename_overrides, overrides_from_table, plan_intake, run_intake,
                      save_rename_overrides)
-from .merge import qc_text, run_merge, script_template
-from .overrides import HEADER as OV_HEADER, read_rows, save_overrides
+from .merge import qc_text, run_merge, script_template, scan_clean
+from .overrides import HEADER as OV_HEADER, read_rows, overrides_text, parse_overrides
 from .report import Report
 from .script import parse_script
 from .util import write_text_atomic
@@ -71,12 +71,9 @@ def settings_from_values(vals) -> Settings:
     d: Dict[str, Any] = dict(zip(KEYS, vals))
     for sp in C.SPEAKERS:
         d[f"{sp}_style"] = C.STYLE_LABELS.get(_s(d.get(f"{sp}_style")), "mako")
-        d[f"{sp}_compact_digits"] = int(d.get(f"{sp}_compact_digits") or 1)
-    d["sample_rate"] = int(d["sample_rate"])
-    d["wav_bit_depth"] = int(d["wav_bit_depth"])
     if not _s(d.get('project')):
         raise ValueError('Choose an episode project folder first.')
-    st = settings_from_dict(d, Settings())
+    st = settings_from_dict(d, Settings(), strict=True)
     validate_intake(st.intake)
     st.merge.validate()
     return st
@@ -98,8 +95,13 @@ def _safe(fn, n: int, warn_i: int, log_i: int):
         except Exception as e:  # noqa: BLE001 - the UI must always answer
             import traceback
             out = [gr.update()] * n
-            out[warn_i] = f"Something unexpected went wrong: {e}. Nothing was deleted."
-            out[log_i] = traceback.format_exc()
+            if isinstance(e, (ValueError, gr.Error)):
+                message = str(e)
+                out[warn_i] = message
+                out[log_i] = message
+            else:
+                out[warn_i] = f'Unable to finish: {e}'
+                out[log_i] = traceback.format_exc()
             return tuple(out) if n > 1 else out[0]
     return wrapper
 
@@ -145,16 +147,47 @@ def _files(rep: Report, out) -> List[str]:
     return [str(Path(out) / o) for o in rep.outputs if o.endswith((".mp3", ".wav"))] if out else []
 
 
+def form_controls(script: str, ov_rows):
+    """Validate current edits once for saving, previews and exports."""
+    script = script or ''
+    parsed = parse_script(script)
+    if parsed.issues:
+        raise ValueError('Invalid dialogue order: ' + '; '.join(i.message for i in parsed.issues))
+    rows = ov_rows.values.tolist() if hasattr(ov_rows, 'values') else (ov_rows or [])
+    text = overrides_text(rows)
+    _, issues = parse_overrides(text)
+    if issues:
+        raise ValueError('Invalid timing or gain: ' + '; '.join(i.message for i in issues))
+    return script, text
+
+
 def _save_texts(st: Settings, script: str, ov_rows) -> None:
+    script, text = form_controls(script, ov_rows)
     proj = Path(st.intake.project)
     if not proj.is_dir():
-        return
-    parsed = parse_script(script or "")
-    if parsed.issues:
-        raise ValueError("Invalid dialogue order: " + "; ".join(str(issue) for issue in parsed.issues))
-    write_text_atomic(proj / C.SCRIPT_FILE, script or "")
-    rows = ov_rows.values.tolist() if hasattr(ov_rows, "values") else (ov_rows or [])
-    save_overrides(proj / C.OVERRIDES_FILE, rows)
+        raise ValueError('Choose an existing episode folder before saving controls.')
+    write_text_atomic(proj / C.SCRIPT_FILE, script)
+    write_text_atomic(proj / C.OVERRIDES_FILE, text)
+
+
+def listen_piece(project, section, token):
+    """Resolve only known, prepared clips; never treat user tokens as file paths."""
+    if not project or not section or not token:
+        raise gr.Error('Choose a section and a prepared clip first.')
+    import re
+    from .names import parse_sec_code
+    match = re.fullmatch(r'([KR])([1-9][0-9]{0,3})', token, re.I)
+    clean = Path(project) / 'clean'
+    if not match or not clean.is_dir():
+        raise gr.Error('Prepare recordings first, then choose an exact clip ID such as K1.')
+    scan, _ = scan_clean(clean)
+    speaker = 'koroush' if match[1].upper() == 'K' else 'reza'
+    path = scan.get(parse_sec_code(str(section)), {}).get(speaker, {}).get(int(match[2]))
+    if path is None:
+        raise gr.Error('That clip is missing from the prepared recordings.')
+    if not path.resolve().is_relative_to(clean.resolve()):
+        raise gr.Error("Prepared clips must be inside this episode's clean folder.")
+    return str(path.resolve())
 
 
 def do_intake(*vals, progress=gr.Progress()):
@@ -186,16 +219,20 @@ def do_both(*vals, progress=gr.Progress()):
     return _warn_block(r1), r1.to_text(), gr.update(choices=files, value=files[0] if files else None)
 
 
-def do_plan(*vals):
+def do_plan(*vals, progress=gr.Progress()):
     st = settings_from_values(vals[:len(KEYS)])
-    res = run_merge(st.intake.project, st.merge, dry_run=True)
+    script, overrides = form_controls(vals[len(KEYS)], vals[len(KEYS) + 1])
+    res = run_merge(st.intake.project, st.merge, lambda f, d: progress(f, desc=d),
+                    dry_run=True, script_text=script, override_text=overrides)
     return res.plan_rows, _warn_block(res.report), res.report.to_text()
 
 
-def do_check(*vals):
+def do_check(*vals, progress=gr.Progress()):
     """Read-only quality check: decodes every clean file, writes nothing."""
     st = settings_from_values(vals[:len(KEYS)])
-    res = run_merge(st.intake.project, st.merge, dry_run=True)
+    script, overrides = form_controls(vals[len(KEYS)], vals[len(KEYS) + 1])
+    res = run_merge(st.intake.project, st.merge, lambda f, d: progress(f, desc=d),
+                    dry_run=True, script_text=script, override_text=overrides)
     return _warn_block(res.report), qc_text(res.qc_rows) + "\n" + res.report.to_text(with_decisions=False)
 
 
@@ -355,7 +392,13 @@ def create_interface() -> "gr.Blocks":
             section = gr.Dropdown(label="Section", choices=[], interactive=True)
             pieces = gr.Dataframe(headers=["Clip in playback order"], value=[], type="array", interactive=True,
                                   datatype=["str"], label="Section pieces - choose a clip below, then move up or down; dialogue IDs use decimal numbers")
-            selected_piece = gr.Dropdown(label="Clip to move", choices=[], interactive=True)
+            selected_piece = gr.Dropdown(label="Clip to move or listen", choices=[], interactive=True)
+            b_listen = gr.Button('Listen to selected clip')
+            clip_audio = gr.Audio(label='Prepared recording (before merge processing)', type='filepath')
+            b_listen.click(listen_piece, [project, section, selected_piece], clip_audio)
+            selected_piece.change(lambda: None, None, clip_audio)
+            section.change(lambda: None, None, clip_audio)
+            project.change(lambda: None, None, clip_audio)
             with gr.Row():
                 b_up = gr.Button("Move up")
                 b_down = gr.Button("Move down")
@@ -369,7 +412,7 @@ def create_interface() -> "gr.Blocks":
             with gr.Accordion("Full episode order / custom script", open=False):
                 script = gr.Textbox(label="Exact clip order, one section per line", lines=8, value=script0,
                                     placeholder="1: K1 R1 K2 R2\n2: R1 K1 R2 K2")
-                gr.Markdown("Use exact dialogue IDs to choose every piece. Legacy speaker turns such as `1: K R K R` are also accepted. Apply changes and save before previewing the merge.")
+                gr.Markdown("Use exact dialogue IDs to choose every piece. Legacy speaker turns such as `1: K R K R` are also accepted. Apply section edits before previewing. Preview uses your current unsaved script and timing controls.")
             with gr.Accordion("Per-clip timing and gain", open=False):
                 ov = gr.Dataframe(headers=OV_HEADER, value=ov0 or [["", "", "", "", "", "", ""]], type="array",
                                   interactive=True, label="Per-line overrides (overrides.csv)", elem_classes=["studio-table"], column_widths=[140] * len(OV_HEADER))
@@ -443,14 +486,15 @@ def create_interface() -> "gr.Blocks":
             b_open = gr.Button("Open project folder")
             b_open.click(open_folder, project, None)
         ins = [comps[k] for k in KEYS] + [script, ov, table]
-        b_prev.click(_safe(do_preview, 3, 1, 2), ins, [table, name_status, name_log])
-        b_in.click(_safe(do_intake, 3, 0, 1), ins, [prepare_status, name_log, files])
-        b_mg.click(_safe(do_merge, 3, 0, 1), ins, [warn, log, files])
-        b_all.click(_safe(do_both, 3, 0, 1), ins, [warn, log, files])
-        b_plan.click(_safe(do_plan, 3, 1, 2), ins, [plan, warn, log])
-        b_chk.click(_safe(do_check, 2, 0, 1), ins, [warn, log])
-        b_tpl.click(_safe(do_template, 2, 1, 1), ins, [script, order_status])
-        b_save.click(_safe(do_save_texts, 1, 0, 0), ins, order_status)
+        processing = dict(concurrency_id="episode-processing", concurrency_limit=1)
+        b_prev.click(_safe(do_preview, 3, 1, 2), ins, [table, name_status, name_log], **processing)
+        b_in.click(_safe(do_intake, 3, 0, 1), ins, [prepare_status, name_log, files], **processing)
+        b_mg.click(_safe(do_merge, 3, 0, 1), ins, [warn, log, files], **processing)
+        b_all.click(_safe(do_both, 3, 0, 1), ins, [warn, log, files], **processing)
+        b_plan.click(_safe(do_plan, 3, 1, 2), ins, [plan, warn, log], **processing)
+        b_chk.click(_safe(do_check, 2, 0, 1), ins, [warn, log], **processing)
+        b_tpl.click(_safe(do_template, 2, 1, 1), ins, [script, order_status], **processing)
+        b_save.click(_safe(do_save_texts, 1, 0, 0), ins, order_status, **processing)
         def load_episode(path):
             loaded = resolve_settings(path)
             from .config import settings_to_dict
