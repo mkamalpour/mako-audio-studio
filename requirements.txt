@@ -1,0 +1,4 @@
+numpy==2.4.6
+gradio==5.50.0
+pyloudnorm==0.1.1
+imageio-ffmpeg==0.6.0
