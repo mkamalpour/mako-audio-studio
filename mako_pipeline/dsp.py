@@ -162,6 +162,74 @@ def peak_db(x: np.ndarray) -> float:
     return 20.0 * np.log10(pk) if pk > 0 else -120.0
 
 
+def measure_lufs_many(clips, sr: int) -> Tuple[Optional[float], str]:
+    """BS.1770 on concatenated mono clips, with bounded working memory.
+
+    Retains filter history and 400 ms gating windows across clip boundaries.
+    The pinned pyloudnorm supplies the same K-weighting coefficients as the
+    single-array meter; only small filtered chunks and block energies are kept.
+    """
+    clips = list(clips)
+    total = sum(len(clip) for clip in clips)
+    if total < 0.5 * sr:
+        return None, 'too short'
+    try:
+        import pyloudnorm as pyln
+        from scipy.signal import lfilter
+        filters = list(pyln.Meter(sr)._filters.values())
+    except (ImportError, AttributeError):
+        frames = np.concatenate([frame_db(clip, sr) for clip in clips])
+        active = frames[frames > np.max(frames) - 40]
+        value = float(10 * np.log10(np.mean(10 ** (active / 10))) - 0.7)
+        return (value if np.isfinite(value) else None), 'approx LUFS'
+    states = [np.zeros(max(len(f.a), len(f.b)) - 1) for f in filters]
+    block_count = int(np.round((total / sr - 0.4) / 0.1)) + 1
+    powers = []
+    buffer = np.empty(0, dtype=np.float64)
+    base = seen = index = 0
+
+    def bounds(j):
+        return int(0.4 * (j * 0.25) * sr), int(0.4 * (j * 0.25 + 1) * sr)
+
+    for clip in clips:
+        for start in range(0, len(clip), 65536):
+            weighted = clip[start:start + 65536].astype(np.float64)
+            for stage, filt in enumerate(filters):
+                weighted, states[stage] = lfilter(filt.b, filt.a, weighted, zi=states[stage])
+                weighted *= filt.passband_gain
+            buffer = np.concatenate((buffer, weighted * weighted))
+            seen += len(weighted)
+            while index < block_count:
+                lower, upper = bounds(index)
+                if upper > seen:
+                    break
+                powers.append(float(np.sum(buffer[lower - base:upper - base])) / (0.4 * sr))
+                index += 1
+            if index < block_count:
+                lower, _ = bounds(index)
+                discard = max(0, min(len(buffer), lower - base))
+                buffer = buffer[discard:].copy()
+                base += discard
+            else:
+                buffer = np.empty(0, dtype=np.float64)
+                base = seen
+    # pyloudnorm rounds the block count; the last block may be partial.
+    while index < block_count:
+        lower, upper = bounds(index)
+        powers.append(float(np.sum(buffer[max(0, lower - base):min(len(buffer), upper - base)])) / (0.4 * sr))
+        index += 1
+    powers = np.asarray(powers)
+    with np.errstate(divide='ignore'):
+        levels = -0.691 + 10 * np.log10(powers)
+    absolute = levels >= -70
+    if not np.any(absolute):
+        return None, 'BS.1770 (pyloudnorm, streaming)'
+    relative = -0.691 + 10 * np.log10(np.mean(powers[absolute])) - 10
+    gated = powers[(levels > relative) & (levels > -70)]
+    value = float(-0.691 + 10 * np.log10(np.mean(gated))) if len(gated) else None
+    return value, 'BS.1770 (pyloudnorm, streaming)'
+
+
 def clip_levels(x: np.ndarray, sr: int) -> Tuple[float, float, float, float]:
     """(head_energy, tail_energy, speech_rms, noise_floor_rms), all linear.
 

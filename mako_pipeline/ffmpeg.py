@@ -92,7 +92,10 @@ def decode_audio(path, sr: int = 48000) -> np.ndarray:
             "can't be decoded - the file is corrupt, incomplete, or not audio "
             f"[{_last_err(cp)}]"
         )
-    return np.frombuffer(buf[: len(buf) // 4 * 4], dtype="<f4").astype(np.float32)
+    audio = np.frombuffer(buf[: len(buf) // 4 * 4], dtype="<f4").astype(np.float32)
+    if not np.isfinite(audio).all():
+        raise RuntimeError('Recording contains non-finite audio samples; re-export it from the recorder.')
+    return audio
 
 
 def duration_s(path) -> float:
@@ -146,23 +149,37 @@ def encode_stream(chunks: Iterable[np.ndarray], sr: int, out, fmt: str = "mp3",
         codec = ["-c:a", "pcm_s24le" if bit_depth == 24 else "pcm_s16le", "-f", "wav"]
     args = [find_ffmpeg(), "-v", "error", "-y", "-f", inp, "-ar", str(sr), "-ac", "1",
             "-i", "pipe:0"] + codec + ["-fflags", "+bitexact", str(tmp)]
-    with tempfile.TemporaryFile() as errf:
-        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                             stderr=errf, creationflags=_flags())
-        try:
-            for ch in chunks:
-                if len(ch):
-                    p.stdin.write(conv(ch))
-            p.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-        rc = p.wait()
-        if rc != 0:
-            errf.seek(0)
-            msg = errf.read().decode("utf-8", "replace").strip().splitlines()
-            tmp.unlink(missing_ok=True)
-            raise RuntimeError(f"encoding {out.name} failed: {(msg[-1] if msg else 'unknown error')[:120]}")
-    os.replace(tmp, out)
+    p = None
+    try:
+        with tempfile.TemporaryFile() as errf:
+            p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=errf, creationflags=_flags())
+            broken = False
+            try:
+                for ch in chunks:
+                    if len(ch):
+                        if not np.isfinite(ch).all():
+                            raise ValueError('Cannot encode non-finite audio samples.')
+                        p.stdin.write(conv(ch))
+            except BrokenPipeError:
+                broken = True
+            finally:
+                try:
+                    p.stdin.close()
+                except BrokenPipeError:
+                    broken = True
+            rc = p.wait(timeout=120)
+            if rc != 0 or broken:
+                errf.seek(0)
+                msg = errf.read().decode("utf-8", "replace").strip().splitlines()
+                raise RuntimeError(f"encoding {out.name} failed: {(msg[-1] if msg else 'encoder pipe closed')[:120]}")
+        os.replace(tmp, out)
+    except BaseException:
+        if p is not None and p.poll() is None:
+            p.kill()
+            p.wait()
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def encode_audio(x: np.ndarray, sr: int, out, fmt: str = "mp3",
@@ -182,7 +199,7 @@ def raw_chunks(raw_path, n_samples: int) -> Iterator[np.ndarray]:
         while left > 0:
             a = np.fromfile(f, dtype="<f4", count=min(CHUNK_SAMPLES, left))
             if len(a) == 0:
-                break
+                raise RuntimeError('Temporary audio buffer ended early; export was not completed.')
             left -= len(a)
             yield a
 

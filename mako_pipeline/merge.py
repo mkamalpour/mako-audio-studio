@@ -18,7 +18,7 @@ from . import constants as C
 from .config import MergeConfig, asdict
 from . import pacing
 from .dsp import (apply_tilt, clip_levels, find_room_tone, longest_silence_ms, make_bed,
-                  measure_lufs, peak_db, speech_edges, tilt_db, tone_spectrum, trim_clip)
+                  measure_lufs_many, peak_db, speech_edges, tilt_db, tone_spectrum, trim_clip)
 from .ffmpeg import (FFmpegMissing, decode_audio, encode_audio, encode_raw, find_ffmpeg)
 from .names import build_clean_name, parse_clean, parse_sec_code, sec_code, speaker_from_token
 from .overrides import Overrides, load_overrides, unused_issues, parse_overrides
@@ -100,6 +100,7 @@ class MergeResult:
     plan_rows: List[List[str]] = field(default_factory=list)
     qc_rows: List[dict] = field(default_factory=list)
     preview_audio: Optional[Tuple[int, np.ndarray]] = None
+    master_gain_db: float = 0.0
 
 
 # ----------------------------------------------------------------------------
@@ -406,7 +407,7 @@ def compute_gains(clips: List[Clip], cfg: MergeConfig, rep: Report) -> Dict[str,
     if cfg.match_loudness:
         for sp, mine in mine_by.items():
             if mine:
-                measured[sp], engines[sp] = measure_lufs(np.concatenate([c.x for c in mine]), sr)
+                measured[sp], engines[sp] = measure_lufs_many((c.x for c in mine), sr)
     known = [v for v in measured.values() if v is not None]
     if cfg.loudness_mode == "match" and known:
         target = min(max(known), C.MATCH_CEILING_LUFS)
@@ -560,7 +561,7 @@ def write_labels(path: Path, rows: List[Tuple[float, float, str]]) -> None:
 
 
 TIMELINE_HEADER = ["section", "line", "speaker", "file", "section_start_s", "section_end_s",
-                   "full_start_s", "full_end_s", "gap_before_ms", "gain_db"]
+                   "full_start_s", "full_end_s", "gap_before_ms", "gain_db", "master_gain_db"]
 
 
 def write_timeline(path: Path, rows: List[dict]) -> None:
@@ -571,7 +572,7 @@ def write_timeline(path: Path, rows: List[dict]) -> None:
         w.writerow([r["section"], r["line"], r["speaker"], r["file"],
                     f"{r['section_start_s']:.3f}", f"{r['section_end_s']:.3f}",
                     f"{r['full_start_s']:.3f}", f"{r['full_end_s']:.3f}",
-                    f"{r['gap_before_ms']:.1f}", f"{r['gain_db']:.2f}"])
+                    f"{r['gap_before_ms']:.1f}", f"{r['gain_db']:.2f}", f"{r.get('master_gain_db', 0):.3f}"])
     write_text_atomic(path, buf.getvalue())
 
 
@@ -723,6 +724,28 @@ def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: boo
                   "lines_skipped": skipped_n, "full_seconds": round(full_len / sr, 3),
                   "gains_db": {k: round(v, 2) for k, v in gains.items()}, "transitions": kinds}
     res.qc_rows = _qc_rows(all_clips)
+    if not dry_run or preview_section is not None:
+        # One constant attenuation for the entire episode, including aligned stems.
+        # This protects overlaps without a compressor, limiter or changed dialogue dynamics.
+        highest = 0.0
+        for position, section in enumerate(sections):
+            if progress:
+                progress(0.4 + 0.08 * position / len(sections), f'Checking mix headroom in section {section}')
+            mix, stems = render_section(plans[section], sr, cfg.export_stems)
+            for track in (mix, *stems.values()):
+                if len(track):
+                    highest = max(highest, float(np.max(np.abs(track))))
+            del mix, stems, track
+        ceiling = 10 ** (cfg.peak_ceiling_dbfs / 20)
+        if highest > ceiling:
+            res.master_gain_db = float(20 * np.log10(ceiling / highest))
+            rep.add('W_MIX_ATTENUATED', f'Applied {res.master_gain_db:.2f} dB to all output tracks '
+                    f'to keep mixed peaks below {cfg.peak_ceiling_dbfs:g} dBFS without clipping.')
+        rep.counts['master_gain_db'] = res.master_gain_db
+        rep.counts['mix_peak_before_dbfs'] = float(20 * np.log10(highest)) if highest else None
+        for row in res.rows:
+            row['master_gain_db'] = res.master_gain_db
+        rep.decide(f'Final mix gain: {res.master_gain_db:+.3f} dB (constant across sections and stems).')
     if preview_section is not None:
         if preview_section not in plans:
             rep.fail('E_NO_READABLE_AUDIO', f'Section {preview_section} has no readable clips in its order.')
@@ -730,6 +753,7 @@ def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: boo
         if progress:
             progress(0.9, f'Rendering section {preview_section} preview')
         audio, _ = render_section(plans[preview_section], sr, False)
+        audio *= 10 ** (res.master_gain_db / 20)
         if len(audio) and float(np.max(np.abs(audio))) > 1.0:
             rep.add('W_OUTPUT_CLIPPED', 'Overlapping clips exceed full scale in the section preview. Reduce gain or overlap.')
         res.preview_audio = (sr, (np.clip(audio, -1, 1) * 32767).round().astype(np.int16))
@@ -765,6 +789,8 @@ def run_merge(project, cfg: MergeConfig, progress: Progress = None, dry_run: boo
     _write_reports(out, cfg, project, all_clips, gains, rep)
     if not rep.failed:
         marker.unlink(missing_ok=True)
+        if progress:
+            progress(1.0, 'Export complete')
     rep.log(f"Output folder: {out}")
     return res
 
@@ -833,14 +859,19 @@ def _export_all(out: Path, cfg: MergeConfig, plans, offsets, full_len, res: Merg
     fmts = _formats(cfg)
     secs = sorted(plans)
     gap_n = int(sr * cfg.section_gap_ms / 1000)
-    with tempfile.TemporaryDirectory(prefix="mako_") as tmp:
-        raw = {k: open(Path(tmp) / f"{k}.f32", "wb") for k in (("mix",) + (C.SPEAKERS if cfg.export_stems else ()))}
+    with tempfile.TemporaryDirectory(prefix=".render-", dir=out) as tmp:
+        tracks = (("mix",) + (C.SPEAKERS if cfg.export_stems else ())) if cfg.export_full else ()
+        raw = {k: open(Path(tmp) / f"{k}.f32", "wb") for k in tracks}
         try:
             for n, s in enumerate(secs):
                 if progress:
-                    progress(0.4 + 0.5 * n / len(secs), f"rendering section {s}")
+                    progress(0.5 + 0.4 * n / len(secs), f"rendering section {s}")
                 pl = plans[s]
                 mix, st = render_section(pl, sr, cfg.export_stems)
+                master = 10 ** (res.master_gain_db / 20)
+                mix *= master
+                for arr in st.values():
+                    arr *= master
                 top = float(np.max(np.abs(mix))) if len(mix) else 0.0
                 if top > 1.0:
                     rep.add("W_OUTPUT_CLIPPED", f"Section {s}: the mix reaches {20 * np.log10(top):+.1f} dBFS "
@@ -862,8 +893,9 @@ def _export_all(out: Path, cfg: MergeConfig, plans, offsets, full_len, res: Merg
                     if n < len(secs) - 1:
                         lastc = pl.places[-1].clip
                         last = lastc.tone if (cfg.room_tone and lastc.tone_on) else None
-                        make_bed(gap_n, last, sr, lastc.floor if lastc.tone_on else 0.0,
-                                 (cfg.seed, s, 99999)).astype("<f4").tofile(raw["mix"])
+                        bed = make_bed(gap_n, last, sr, lastc.floor if lastc.tone_on else 0.0,
+                                       (cfg.seed, s, 99999))
+                        (bed * master).astype("<f4").tofile(raw["mix"])
                         for sp in st:
                             np.zeros(gap_n, dtype="<f4").tofile(raw[sp])
                 del mix, st
@@ -907,6 +939,7 @@ def _write_reports(out: Path, cfg: MergeConfig, project: Path, clips: List[Clip]
                        if f.is_file() and f.name not in ("manifest.json", "INCOMPLETE.txt")
                        and not f.name.endswith(".part")],
            "gains_db": {k: round(v, 4) for k, v in gains.items()},
+           "master_gain_db": rep.counts.get('master_gain_db', 0),
            "warnings": [i.to_dict() for i in rep.issues]}
     write_text_atomic(out / "manifest.json", json.dumps(man, indent=2, ensure_ascii=False))
 

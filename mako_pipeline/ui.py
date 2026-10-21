@@ -421,6 +421,36 @@ def do_section_preview(*vals, progress=gr.Progress()):
     return res.preview_audio, _warn_block(res.report) + '\n' + res.report.to_text(with_decisions=False)
 
 
+def preview_signature(vals):
+    """Identify the exact form state a rendered preview belongs to."""
+    import hashlib
+    import json
+    from .config import settings_to_dict
+    st = settings_from_values(vals[:len(KEYS)])
+    script, overrides = form_controls(vals[len(KEYS)], vals[len(KEYS) + 1])
+    data = [settings_to_dict(st), script, overrides, str(vals[len(KEYS) + 2])]
+    return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def stage_section_preview(*vals, progress=gr.Progress()):
+    signature = preview_signature(vals)
+    audio, status = do_section_preview(*vals, progress=progress)
+    return dict(signature=signature, audio=audio, status=status)
+
+
+def publish_section_preview(result, *vals):
+    """Recheck live inputs after rendering, before exposing playable audio."""
+    if not isinstance(result, dict):
+        return None, str(result or 'Unable to render the section preview.')
+    try:
+        current = preview_signature(vals)
+    except ValueError:
+        current = None
+    if result.get('signature') != current:
+        return None, 'Order or settings changed during rendering. Render a fresh section preview.'
+    return result.get('audio'), result.get('status', '')
+
+
 def create_interface() -> "gr.Blocks":
     st = resolve_settings()
     env = check_environment()
@@ -537,7 +567,8 @@ def create_interface() -> "gr.Blocks":
                 with gr.Row():
                     b_render_section = gr.Button("Render section preview", variant="primary")
                     b_save = gr.Button("Save dialogue order and overrides")
-                section_audio = gr.Audio(label="Rendered section ? current order and sound settings", type="numpy")
+                section_audio = gr.Audio(label="Rendered section - current order and sound settings", type="numpy")
+                pending_preview = gr.State(None, time_to_live=600)
                 section_report = gr.Textbox(label="Section preview status", lines=3, interactive=False)
                 order_status = gr.Textbox(label="Order status", lines=2, interactive=False)
                 bridge.input(timeline_edit, [bridge, project, script, section, selected_piece, board_history],
@@ -550,7 +581,7 @@ def create_interface() -> "gr.Blocks":
                 section.change(section_rows, [script, section], pieces)
                 b_apply.click(apply_section, [script, section, pieces], script)
             with gr.Tab("3 - Sound & export", id=3):
-                gr.Markdown("### Make the edit feel natural\nTrim empty edges, set comfortable pauses and balance both voices. Start here; open the detailed controls only when needed.")
+                gr.Markdown("### Make the edit feel natural\nTrim empty edges, set comfortable pauses and balance both voices. Final mix headroom is protected automatically, including speaker tracks. Open the detailed controls only when needed.")
                 with gr.Row():
                     sound_preset = gr.Dropdown(list(SOUND_PRESETS), value="Natural conversation", label="Sound starting point", scale=3)
                     b_preset = gr.Button("Apply sound preset", scale=1)
@@ -628,9 +659,11 @@ def create_interface() -> "gr.Blocks":
         for control in [script, ov, section] + [comps[key] for key in KEYS]:
             control.change(lambda: (None, "Order or settings changed. Render a fresh section preview."),
                            None, [section_audio, section_report], queue=False)
-        b_render_section.click(_safe(do_section_preview, 2, 1, 1),
-                               [comps[k] for k in KEYS] + [script, ov, section],
-                               [section_audio, section_report], **processing)
+        preview_inputs = [comps[k] for k in KEYS] + [script, ov, section]
+        b_render_section.click(_safe(stage_section_preview, 1, 0, 0), preview_inputs,
+                               pending_preview, **processing).then(
+                                   publish_section_preview, [pending_preview] + preview_inputs,
+                                   [section_audio, section_report], queue=False)
         b_prev.click(_safe(do_preview, 3, 1, 2), ins, [table, name_status, name_log], **processing)
         b_in.click(_safe(do_intake, 3, 0, 1), ins, [prepare_status, name_log, files], **processing)
         b_mg.click(_safe(do_merge, 3, 0, 1), ins, [warn, log, files], **processing)

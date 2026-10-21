@@ -595,6 +595,8 @@ def run_intake(cfg: IntakeConfig, plan: Optional[IntakePlan] = None,
                 cnt["skipped"] += 1
                 rep.log(f"   SKIPPED  {it.src.name}  ({it.note})")
     add_mode = cfg.intake_mode == "add"
+    prepared_coordinates = {parse_clean(p.stem) for p in clean.iterdir()
+                            if p.is_file() and p.suffix.lower() in C.CLEAN_EXTS}
     if add_mode:
         rep.log("Add mode: existing clean files are kept; only lines that are not there yet are written.")
     for it in plan.items:
@@ -606,7 +608,7 @@ def run_intake(cfg: IntakeConfig, plan: Optional[IntakePlan] = None,
         done += 1
         if it.status == "dup":
             _do_dup_item(it, clean, rep, cnt)
-        elif add_mode and any((clean / it.new_name(e)).exists() for e in C.CLEAN_EXTS):
+        elif add_mode and (it.section, it.line, it.speaker) in prepared_coordinates:
             cnt["skipped"] += 1
             rep.log(f"   SKIPPED  {it.src.name}  ({it.new_name('.' + cfg.clean_format)} is already in clean/; "
                     "intake_mode=add keeps it)")

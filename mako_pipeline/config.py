@@ -117,6 +117,7 @@ CHOICES = {
 }
 INTAKE_CHOICES = {"clean_format": ("mp3", "wav"), "dup_policy": ("newest", "oldest", "manual"),
                   "intake_mode": C.INTAKE_MODES}
+MP3_BITRATES = tuple(f'{rate}k' for rate in (32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320))
 
 
 def _problems(cfg: MergeConfig) -> List[str]:
@@ -130,6 +131,8 @@ def _problems(cfg: MergeConfig) -> List[str]:
             out.append(f"{k}={getattr(cfg, k)!r} (allowed {list(allowed)})")
     if not cfg.export_mp3 and not cfg.export_wav:
         out.append('Enable at least one output format: WAV or MP3')
+    if cfg.mp3_bitrate not in MP3_BITRATES:
+        out.append('mp3_bitrate must be a supported bitrate such as 128k, 192k or 320k')
     if cfg.room_tone_min_ms > cfg.room_tone_max_ms:
         out.append('room_tone_min_ms must not exceed room_tone_max_ms')
     if cfg.qc_short_line_s > cfg.qc_long_line_s:
@@ -146,6 +149,8 @@ def validate_intake(cfg: IntakeConfig) -> None:
     from .names import compile_pattern
     if not math.isfinite(cfg.verify_tolerance_s) or not 0 <= cfg.verify_tolerance_s <= 10:
         problems.append('verify_tolerance_s must be finite and between 0 and 10')
+    if cfg.mp3_bitrate not in MP3_BITRATES:
+        problems.append('mp3_bitrate must be a supported bitrate such as 128k, 192k or 320k')
     for sc in cfg.speakers.values():
         if sc.style == 'custom':
             compile_pattern(sc.pattern)
