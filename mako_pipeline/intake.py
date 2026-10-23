@@ -117,7 +117,7 @@ def save_rename_overrides(path, rows: List[RenameRow]) -> None:
                     "" if r.section is None else r.section,
                     "" if r.line is None else r.line])
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(out.getvalue(), encoding="utf-8")
+    write_text_atomic(path, out.getvalue())
 
 
 # ----------------------------------------------------------------------------

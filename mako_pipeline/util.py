@@ -5,6 +5,7 @@ import datetime as _dt
 import hashlib
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import List, Union
 
@@ -56,9 +57,14 @@ def part_path(p: Union[str, Path]) -> Path:
 
 
 def write_text_atomic(path: Union[str, Path], text: str, newline: str = "\n") -> None:
-    """Write a text file so that a crash never leaves a half-written file under its real name."""
+    """Stage complete text before replacement, with a separate file for each save."""
     path = Path(path)
-    tmp = part_path(path)
-    with open(tmp, "w", encoding="utf-8", newline=newline) as f:
-        f.write(text)
-    os.replace(tmp, path)
+    descriptor, name = tempfile.mkstemp(prefix="." + path.name + "-", suffix=".part", dir=path.parent)
+    os.close(descriptor)
+    tmp = Path(name)
+    try:
+        with tmp.open("w", encoding="utf-8", newline=newline) as stream:
+            stream.write(text)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
