@@ -20,11 +20,12 @@ class FFmpegMissing(Exception):
     """Raised when no FFmpeg binary can be found."""
 
 
-_CACHE = {"path": None}  # the only hidden global state: the cached FFmpeg path
+_CACHE = {"path": None, "mp3_encoder": None}  # the only hidden global state: the cached FFmpeg path
 
 
 def reset_cache() -> None:
     _CACHE["path"] = None
+    _CACHE["mp3_encoder"] = None
 
 
 def _imageio_path() -> Optional[str]:
@@ -77,6 +78,19 @@ def _run(args: List[str], data: Optional[bytes] = None) -> subprocess.CompletedP
     )
 
 
+def _mp3_encoder() -> str:
+    """Use an encoder actually present in this FFmpeg build, including Windows MF."""
+    if _CACHE.get("mp3_encoder"):
+        return _CACHE["mp3_encoder"]
+    result = _run(["-hide_banner", "-encoders"])
+    listing = (result.stdout or b"").decode("utf-8", "replace")
+    for name in ("libmp3lame", "mp3_mf"):
+        if any(len(line.split()) > 1 and line.split()[1] == name for line in listing.splitlines()):
+            _CACHE["mp3_encoder"] = name
+            return name
+    raise RuntimeError("This FFmpeg has no supported MP3 encoder. Select WAV output or choose an existing FFmpeg with libmp3lame or mp3_mf.")
+
+
 def _last_err(cp: subprocess.CompletedProcess) -> str:
     txt = (cp.stderr or b"").decode("utf-8", "replace").strip().splitlines()
     return (txt[-1] if txt else "no details")[:120]
@@ -115,7 +129,7 @@ def convert_file(src, dst, fmt: str = "mp3", bitrate: str = "320k") -> Tuple[boo
     if fmt == "wav":
         codec = ["-c:a", "pcm_s24le", "-f", "wav"]
     else:
-        codec = ["-c:a", "libmp3lame", "-b:a", bitrate, "-f", "mp3"]
+        codec = ["-c:a", _mp3_encoder(), "-b:a", bitrate, "-f", "mp3"]
     attempts = [[], ["-ar", "48000"]] if fmt != "wav" else [[]]
     err = ""
     for extra in attempts:  # libmp3lame only supports some sample rates: retry at 48 kHz
@@ -143,7 +157,7 @@ def encode_stream(chunks: Iterable[np.ndarray], sr: int, out, fmt: str = "mp3",
     tmp = part_path(out)
     if fmt == "mp3":  # one conversion to 16-bit for the MP3 pipe
         inp, conv = "s16le", _to_s16
-        codec = ["-c:a", "libmp3lame", "-b:a", bitrate, "-f", "mp3"]
+        codec = ["-c:a", _mp3_encoder(), "-b:a", bitrate, "-f", "mp3"]
     else:
         inp, conv = "f32le", _to_f32
         codec = ["-c:a", "pcm_s24le" if bit_depth == 24 else "pcm_s16le", "-f", "wav"]

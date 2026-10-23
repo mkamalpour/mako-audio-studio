@@ -139,3 +139,17 @@ def test_late_preview_is_not_playable_after_form_changes(tmp_path, change):
 def test_invalid_mp3_bitrate_is_rejected_before_processing():
     with pytest.raises(ValueError, match='mp3_bitrate'):
         MergeConfig(mp3_bitrate='typo').validate()
+
+
+def test_mp3_encoder_matches_installed_ffmpeg(monkeypatch):
+    from types import SimpleNamespace
+    from mako_pipeline import ffmpeg
+    for listing, expected in [(b" A....D mp3_mf MP3 via MediaFoundation\n", "mp3_mf"), (b" A....D mp3_mf Native\n A....D libmp3lame LAME\n", "libmp3lame")]:
+        ffmpeg.reset_cache()
+        monkeypatch.setattr(ffmpeg, "_run", lambda args, data=None: SimpleNamespace(stdout=listing, stderr=b"", returncode=0))
+        assert ffmpeg._mp3_encoder() == expected
+    ffmpeg.reset_cache()
+    monkeypatch.setattr(ffmpeg, "_run", lambda args, data=None: SimpleNamespace(stdout=b" A....D pcm_s24le PCM\n", stderr=b"", returncode=0))
+    import pytest
+    with pytest.raises(RuntimeError, match="Select WAV"):
+        ffmpeg._mp3_encoder()
