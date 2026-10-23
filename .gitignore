@@ -56,3 +56,9 @@ projects/
 *.pth
 .DS_Store
 Thumbs.db
+
+# Local secrets, caches and private runtime files
+.cache/
+.ipynb_checkpoints/
+.streamlit/secrets.toml
+*.db-*
