@@ -1,22 +1,26 @@
-# Mako Audio Studio
+# mako-audio-studio
 
 A local recording-to-episode workspace for Reza and Koroush's **Mako Entertainment** channel. Select each speaker's recording folder, review names, arrange clips section by section, and export an episode for Filmora or another editor.
 
+## Try it first
+
+Create a separate episode project folder and select the speaker recording folders in **Recordings & names**. Preview the assignments before preparing recordings. Arrange a short section in **Dialogue order**, then export it and listen before processing a whole episode.
+
 ## Start on Windows
 
-Use **Python 3.11**. Activate an existing environment with the dependencies, run `check_setup.bat`, then `run_mako.bat`. Both scripts install nothing. The interface opens in your browser at the local address printed by Gradio (usually http://127.0.0.1:7860).
+Use your existing Conda **base** environment (tested with Python **3.13.5**). Activate it, run `check_setup.bat`, then `run_mako.bat`. Both scripts install nothing. The interface opens in your browser at the local address printed by Gradio (usually http://127.0.0.1:7860).
 
 Or install manually:
 
 ```powershell
-conda activate base  # Or activate another existing compatible environment.
-# Optional dependency setup; requires explicit permission and connectivity.
+conda activate base  # Or use your existing compatible environment.
+# Install dependencies if they are not already available in your environment.
 python -m pip install -r requirements.txt
 python mako.py check
 python mako.py
 ```
 
-Verified here: Windows, Python 3.11.0, NumPy 2.4.6, SciPy 1.17.1, Gradio 5.50.0, pyloudnorm 0.1.1, imageio-ffmpeg 0.6.0 (bundled FFmpeg 7.1). Other runtimes have not been verified. FFmpeg is included by the Python dependency; `MAKO_FFMPEG` can point to another installation. MP3 export selects available libmp3lame or Windows mp3_mf; WAV remains available without an MP3 encoder.
+Current checks use Windows, Conda base, Python 3.13.5, NumPy 2.1.3, SciPy 1.15.3, and Gradio 5.49.1. The installed Conda FFmpeg is found even when Python is launched without activation; `MAKO_FFMPEG` can select another existing executable. `imageio-ffmpeg` is another supported source when installed. MP3 export uses libmp3lame or Windows mp3_mf when available; WAV remains available without an MP3 encoder. The pinned dependency file records the earlier full installation baseline; do not reinstall a working environment just to start the app.
 
 ## Your workflow
 
@@ -66,7 +70,7 @@ Exports include section WAV/MP3 files, `FULL.wav`/`FULL.mp3`, SRT clip labels (n
 python mako.py all --project D:/Mako/Episode01 --koroush D:/Recordings/K --reza D:/Recordings/R
 python mako.py preview --project D:/Mako/Episode01 --koroush D:/Recordings/K --json
 python mako.py merge --project D:/Mako/Episode01 --dry-run
-# Optional dependency setup; requires explicit permission and connectivity.
+# Install dependencies if they are not already available in your environment.
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
@@ -75,8 +79,10 @@ Other commands: `intake`, `qc`, `script-template`, `check`; use `--help` for opt
 
 Verification in this environment: **106 automated checks passed**. Browser checks covered real drag/save/export, undo/redo, remove/reinsert, keyboard ordering, and processed section playback. A regression test verifies section-preview audio matches its full export within integer sample precision. Tests also cover naming, source preservation, failed replacements, exact ordering, seeded pacing, and stale-editor action rejection. A 96-clip synthetic episode (12 minutes 25 seconds) passed conversion, corrupt-input reporting, WAV/MP3 export, stem alignment, 96 SRT cues, and manifest hash checks; source hashes stayed unchanged. Browser checks also rejected playback when the order changed during rendering. Real voice quality and Filmora import still require listening/manual validation. Loudness analysis streams bounded-size chunks, but long episodes still hold decoded clips in memory; section preview analyzes the episode to keep global levels/pacing consistent, so it is not instantaneous. No incremental render or packaged executable is included.
 
-Current lightweight check (Windows, existing Conda base / Python 3.13.5): **109 passed**. No dependency installs, model downloads, live publishing, or heavy datasets were used.
+Checked on Windows with Python 3.13.5 (Conda base): **117 tests passed**.
 
 No license file is included.
 
 Text settings, scripts, timing controls and rename corrections use independent staging files before replacement. A failed replacement preserves saved work and cleans its staging file; overlapping saves no longer share one temporary filename.
+
+The browser workflow was also checked with two synthetic recordings: name preview, preparation, dialogue order, WAV/MP3 export, and the exported-audio player. Playback uses Gradio's managed cache, including for episode folders outside the app directory. Cached playback copies expire after a day; the hourly cleanup never deletes episode originals. A 390-pixel-wide viewport had no page-level horizontal overflow. This does not measure the sound quality of a full recorded episode.

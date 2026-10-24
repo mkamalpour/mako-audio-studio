@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Tuple
@@ -48,6 +49,13 @@ def _candidates() -> List[str]:
     w = shutil.which("ffmpeg")
     if w:
         out.append(w)
+    # Calling an environment's python.exe directly does not activate Conda's
+    # Library/bin PATH entry. Reuse its installed encoder without a download.
+    prefix = Path(sys.prefix)
+    for relative in ("Library/bin/ffmpeg.exe", "bin/ffmpeg", "Scripts/ffmpeg.exe"):
+        candidate = prefix / relative
+        if candidate.is_file():
+            out.append(str(candidate))
     here = Path(__file__).resolve().parent.parent
     for name in ("ffmpeg.exe", "ffmpeg"):
         p = here / name
@@ -58,10 +66,11 @@ def _candidates() -> List[str]:
 
 def find_ffmpeg() -> str:
     """Return the FFmpeg path or raise FFmpegMissing."""
-    if _CACHE["path"]:
+    if _CACHE["path"] and os.path.isfile(_CACHE["path"]):
         return _CACHE["path"]
+    reset_cache()
     for c in _candidates():
-        if c and os.path.exists(c):
+        if c and os.path.isfile(c):
             _CACHE["path"] = c
             return c
     raise FFmpegMissing("FFmpeg was not found. " + FFMPEG_HINT)

@@ -89,7 +89,7 @@ WARNING_CODES = {
     "W_MIX_ATTENUATED",
 }
 
-FFMPEG_HINT = "run: pip install imageio-ffmpeg"
+FFMPEG_HINT = "Set MAKO_FFMPEG to an existing FFmpeg executable, or install imageio-ffmpeg when connectivity is available."
 
 # File names inside the project folder
 SETTINGS_FILE = "mako_settings.json"

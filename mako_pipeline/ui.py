@@ -191,6 +191,28 @@ def listen_piece(project, section, token):
     return str(path.resolve())
 
 
+def cache_playback(path, project, component):
+    """Serve only episode audio through Gradio's managed file cache.
+
+    Episode folders normally live outside the application's working directory.
+    Caching the selected file avoids granting the browser access to whole drives.
+    """
+    if not path:
+        return None
+    if not project:
+        raise gr.Error('Choose the episode project before listening.')
+    root = Path(project).resolve()
+    try:
+        source = Path(path).resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise gr.Error('This recording is no longer available. Export or prepare it again.') from exc
+    if (not source.is_file() or source.suffix.lower() not in ('.wav', '.mp3')
+            or not any(source.is_relative_to(root / name)
+                       for name in ('clean', 'merged'))):
+        raise gr.Error('Choose a prepared or exported audio file from this episode.')
+    return component.move_resource_to_block_cache(str(source))
+
+
 def do_intake(*vals, progress=gr.Progress()):
     st = settings_from_values(vals[:len(KEYS)])
     _save(st)
@@ -454,7 +476,7 @@ def publish_section_preview(result, *vals):
 def create_interface() -> "gr.Blocks":
     st = resolve_settings()
     env = check_environment()
-    with gr.Blocks(title="Mako Audio Studio", theme=gr.themes.Soft(primary_hue="teal", font=["Segoe UI", "Arial", "sans-serif"], font_mono=["Consolas", "monospace"]), js=TIMELINE_JS, css=TIMELINE_CSS + """
+    with gr.Blocks(title="Mako Audio Studio", delete_cache=(3600, 86400), theme=gr.themes.Soft(primary_hue="teal", font=["Segoe UI", "Arial", "sans-serif"], font_mono=["Consolas", "monospace"]), js=TIMELINE_JS, css=TIMELINE_CSS + """
         .gradio-container {max-width: 1220px !important; font-family: 'Segoe UI', sans-serif;}
         #studio-header {border-left: 4px solid #0f766e; padding: 8px 20px; margin: 12px 0 22px;}
         #studio-header h1 {letter-spacing: -.04em; font-size: 36px; margin-bottom: 6px;}
@@ -543,7 +565,8 @@ def create_interface() -> "gr.Blocks":
                 selected_piece = gr.Dropdown(label="Selected clip", choices=[], interactive=True)
                 b_listen = gr.Button('Listen to selected clip')
                 clip_audio = gr.Audio(label='Prepared recording (before merge processing)', type='filepath')
-                b_listen.click(listen_piece, [project, section, selected_piece], clip_audio)
+                b_listen.click(lambda p, s, token: cache_playback(listen_piece(p, s, token), p, clip_audio),
+                               [project, section, selected_piece], clip_audio)
                 selected_piece.change(lambda: None, None, clip_audio)
                 section.change(lambda: None, None, clip_audio)
                 project.change(lambda: None, None, clip_audio)
@@ -645,7 +668,7 @@ def create_interface() -> "gr.Blocks":
                 plan = gr.Dataframe(headers=PLAN_HEAD, value=[], type="array", interactive=False, label="Merge plan", elem_classes=["studio-table"], column_widths=[160] * len(PLAN_HEAD))
                 files = gr.Dropdown([], label="Merged files")
                 audio = gr.Audio(label="Listen", type="filepath")
-                files.change(lambda p: p, files, audio)
+                files.change(lambda path, p: cache_playback(path, p, audio), [files, project], audio)
                 b_open = gr.Button("Open project folder")
                 b_open.click(open_folder, project, None)
         workflow.change(lambda value: gr.update(selected=int(value[0])), workflow, tabs, queue=False)
